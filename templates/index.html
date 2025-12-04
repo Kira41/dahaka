@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Email Checker</title>
+    <meta charset="UTF-8">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.5/font/bootstrap-icons.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { padding: 20px; }
+        .full-width-progress {
+            height: 30px;
+            margin: 20px 0;
+        }
+        .email-item { 
+            background: #f8f9fa; 
+            padding: 10px; 
+            margin: 5px 0; 
+            border-radius: 4px;
+            transition: all 0.2s ease;
+        }
+        .proxy-item { 
+            padding: 8px; 
+            margin: 5px 0; 
+            border-radius: 4px;
+            transition: all 0.2s ease;
+        }
+        .proxy-item.active { background: #d4edda; }
+        .proxy-item.failed { background: #f8d7da; }
+        .proxy-item.available { background: #fff3cd; }
+        .proxy-item.retrying { background: #ffeeba; }
+        .status-present { color: green; font-weight: bold; }
+        .status-failure { color: red; font-weight: bold; }
+        .status-retrying { color: orange; font-weight: bold; }
+        .badge-turbo { 
+            font-size: 1rem; 
+            padding: 5px 10px;
+            animation: pulse 2s infinite;
+        }
+        .card-header { 
+            display: flex; 
+            justify-content: space-between; 
+            align-items: center; 
+        }
+        @keyframes pulse {
+            0% { opacity: 0.7; transform: scale(1); }
+            50% { opacity: 1; transform: scale(1.05); }
+            100% { opacity: 0.7; transform: scale(1); }
+        }
+        .uptime-container {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        .result-card {
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+        }
+        .result-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 0.5rem 1.5rem rgba(0,0,0,0.1);
+        }
+        .result-value {
+            font-size: 1.5rem;
+            font-weight: bold;
+        }
+        .proxy-details-scroll {
+            max-height: 250px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            background-color: #1c1f23;
+            border-radius: 0.375rem;
+            padding: 10px;
+        }
+        .icon-spacing { margin-right: 8px; }
+    </style>
+</head>
+<body>
+<div class="container-fluid">
+    <h1 class="mb-4 text-center">Email Checker Dashboard 
+        <span id="turbo-badge" class="badge bg-danger badge-turbo d-none">TURBO MODE</span>
+    </h1>
+
+    <!-- Progress Section -->
+    <div class="row mb-4">
+        <div class="col-12">
+            <div class="d-flex align-items-center mb-2">
+                <h5 class="mb-0 me-3">Progress:</h5>
+                <p class="mb-0"><span id="processed">0</span>/<span id="total">0</span> emails</p>
+            </div>
+            <div class="progress full-width-progress">
+                <div class="progress-bar bg-gradient" id="progress-bar" role="progressbar" style="width: 0%">
+                    <span id="progress-text">0%</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Dashboard Cards -->
+    <div class="row mb-4">
+        <div class="col-md-3">
+            <div class="card h-100 result-card">
+                <div class="card-header bg-primary text-white">
+                    <span>Status</span>
+                    <span class="badge bg-light text-dark" id="status-badge">Starting...</span>
+                </div>
+                <div class="card-body">
+                    <h5>Uptime: </h5><span id="uptime-container" class="uptime-container"></span>
+                    <h5>Finishing Time: <span id="finishing-time">Calculating...</span></h5>
+                    <ul>
+                        <li>Emails/hour: <code id="emails-hour">0</code></li>
+                        <li>Emails/day: <code id="emails-day">0</code></li>
+                        <li>Emails/week: <code id="emails-week">0</code></li>
+                        <li>Emails/month: <code id="emails-month">0</code></li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card h-100 result-card">
+                <div class="card-header bg-success text-white">
+                    <span>Results</span>
+                    <span class="badge bg-light text-dark" id="results-badge">0</span>
+                </div>
+                <div class="card-body text-center">
+                    <div class="row g-2">
+                        <div class="col-6">
+                            <i class="bi bi-check-circle-fill text-success icon-spacing fs-1"></i>
+                            <h5 class="mt-2">Valid</h5>
+                            <div class="result-value text-success" id="success-count">0</div>
+                        </div>
+                        <div class="col-6">
+                            <i class="bi bi-x-circle-fill text-danger icon-spacing fs-1"></i>
+                            <h5 class="mt-2">Invalid</h5>
+                            <div class="result-value text-danger" id="failure-count">0</div>
+                        </div>
+                    </div>
+                    <div class="col-12 mt-4">
+                        <canvas id="emailChart" width="390" height="267" style="display: block; box-sizing: border-box; height: 214px; width: 312px; margin-top: 80px;"></canvas>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card h-100 result-card">
+                <div class="card-header bg-secondary text-white">
+                    <span>Proxy Stats</span>
+                    <span class="badge bg-light text-dark" id="proxy-count">0</span>
+                </div>
+                <div class="card-body text-center">
+                    <p>Total Proxies: <strong><span id="proxy-total">0</span></strong></p>
+                    <div class="row g-2">
+                        <div class="col-6">
+                            <i class="bi bi-check-circle-fill text-success icon-spacing fs-1"></i>
+                            <h6 class="mt-2">Active</h6>
+                            <div class="result-value text-success" id="proxy-active">0</div>
+                        </div>
+                        <div class="col-6">
+                            <i class="bi bi-x-circle-fill text-danger icon-spacing fs-1"></i>
+                            <h6 class="mt-2">Failed</h6>
+                            <div class="result-value text-danger" id="proxy-failed">0</div>
+                        </div>
+                    </div>
+                    <div class="row g-2 mt-2">
+                        <div class="col-6">
+                            <i class="bi bi-arrow-repeat text-warning icon-spacing fs-1"></i>
+                            <h6 class="mt-2">Retrying</h6>
+                            <div class="result-value text-warning" id="proxy-retrying">0</div>
+                        </div>
+                        <div class="col-6">
+                            <i class="bi bi-clock-history text-secondary icon-spacing fs-1"></i>
+                            <h6 class="mt-2">Available</h6>
+                            <div class="result-value text-secondary" id="proxy-available">0</div>
+                        </div>
+                    </div>
+                    <div class="col-12 mt-3">
+                        <canvas id="proxyChart" width="100" height="100"></canvas>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card h-100 result-card">
+                <div class="card-header bg-info text-dark">
+                    <span>Config Settings</span>
+                </div>
+                <div class="card-body text-black" style="font-size: 0.9rem;">
+                    <div id="config-details"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Proxy List & Activity -->
+    <div class="row">
+        <div class="col-md-6">
+            <div class="card mb-4">
+                <div class="card-header bg-warning text-dark">
+                    <span>Proxy List</span>
+                    <span class="badge bg-light text-dark" id="proxy-list-count">0</span>
+                </div>
+                <div class="card-body" style="max-height: 400px; overflow-y: auto">
+                    <div id="proxies-list"></div>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-6">
+            <div class="card mb-4">
+                <div class="card-header bg-dark text-white">
+                    <span>Current Activity</span>
+                    <span class="badge bg-light text-dark" id="current-count">0</span>
+                </div>
+                <div class="card-body" style="max-height: 400px; overflow-y: auto">
+                    <div id="current-emails"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Socket.io Script -->
+<script>
+const socket = io();
+
+// Initialize Email Chart
+const emailCtx = document.getElementById('emailChart').getContext('2d');
+const emailChart = new Chart(emailCtx, {
+    type: 'doughnut',
+    data: {
+        labels: ['Verified', 'Non-Existent', 'Unverified'],
+        datasets: [{
+            label: 'Email Status',
+            data: [0, 0, 0],
+            backgroundColor: [
+                'rgba(40, 167, 69, 0.8)',
+                'rgba(220, 53, 69, 0.8)',
+                'rgba(173, 181, 189, 0.8)'
+            ],
+            borderColor: [
+                'rgba(40, 167, 69, 1)',
+                'rgba(220, 53, 69, 1)',
+                'rgba(173, 181, 189, 1)'
+            ],
+            borderWidth: 1
+        }]
+    },
+    options: {
+        responsive: false,
+        plugins: {
+            legend: {
+                position: 'bottom',
+                labels: {
+                    padding: 15,
+                    boxWidth: 12
+                }
+            }
+        }
+    }
+});
+
+// Initialize Proxy Chart
+const proxyCtx = document.getElementById('proxyChart').getContext('2d');
+const proxyChart = new Chart(proxyCtx, {
+    type: 'doughnut',
+    data: {
+        labels: ['Active', 'Failed', 'Retrying', 'Available'],
+        datasets: [{
+            label: 'Proxy Status',
+            data: [0, 0, 0, 0],
+            backgroundColor: [
+                'rgba(40, 167, 69, 0.8)',
+                'rgba(220, 53, 69, 0.8)',
+                'rgba(255, 193, 7, 0.8)',
+                'rgba(173, 181, 189, 0.8)'
+            ],
+            borderColor: [
+                'rgba(40, 167, 69, 1)',
+                'rgba(220, 53, 69, 1)',
+                'rgba(255, 193, 7, 1)',
+                'rgba(173, 181, 189, 1)'
+            ],
+            borderWidth: 1
+        }]
+    },
+    options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+            legend: {
+                position: 'bottom',
+                labels: {
+                    padding: 15,
+                    boxWidth: 12
+                }
+            }
+        }
+    }
+});
+
+// Socket Updates
+socket.on('update', function(data) {
+    const turboBadge = document.getElementById('turbo-badge');
+    if (data.in_turbo_mode) turboBadge.classList.remove('d-none');
+    else turboBadge.classList.add('d-none');
+    document.getElementById('status-badge').innerText = data.status;
+
+    // Uptime breakdown
+    let totalSeconds = Math.floor(data.uptime);
+    let months = Math.floor(totalSeconds / (30 * 86400));
+    totalSeconds %= (30 * 86400);
+    let days = Math.floor(totalSeconds / 86400);
+    totalSeconds %= 86400;
+    let hours = Math.floor(totalSeconds / 3600);
+    totalSeconds %= 3600;
+    let minutes = Math.floor(totalSeconds / 60);
+    let seconds = totalSeconds % 60;
+    function pad(n) { return n < 10 ? '0' + n : n; }
+    document.getElementById('uptime-container').innerHTML = `<ul>
+       <li><code>${pad(months)}</code> months</li>
+       <li><code>${pad(days)}</code> days</li>
+       <li><code>${pad(hours)}</code> hours</li>
+       <li><code>${pad(minutes)}</code> minutes</li>
+       <li><code>${pad(seconds)}</code> seconds</li>
+    </ul>`;
+
+    // Progress bar
+    const processed = data.processed;
+    const total = data.total_emails;
+    document.getElementById('processed').innerText = processed;
+    document.getElementById('total').innerText = total;
+    const progressPercent = (processed / total * 100);
+    const progressBar = document.getElementById('progress-bar');
+    progressBar.style.width = progressPercent + '%';
+    progressBar.setAttribute('aria-valuenow', progressPercent);
+    document.getElementById('progress-text').innerText = progressPercent.toFixed(1) + '%';
+    progressBar.className = 
+        progressPercent > 75 ? 'progress-bar bg-success' :
+        progressPercent > 50 ? 'progress-bar bg-info' :
+        progressPercent > 25 ? 'progress-bar bg-warning' : 'progress-bar bg-danger';
+
+    // Email Chart Update
+    const unverified = data.total_emails - data.processed;
+    emailChart.data.datasets[0].data = [data.success, data.failure, unverified];
+    emailChart.update();
+
+    // Proxy Chart Update
+    const active = data.proxies.active || 0;
+    const failed = data.proxies.failed || 0;
+    const retrying = data.proxies.retrying || 0;
+    const available = (data.proxies.total || 0) - (active + failed); // ✅ Updated here
+    proxyChart.data.datasets[0].data = [active, failed, retrying, available];
+    proxyChart.update();
+
+    // Update DOM Elements
+    document.getElementById('success-count').innerText = data.success;
+    document.getElementById('failure-count').innerText = data.failure;
+    document.getElementById('results-badge').innerText = data.success + data.failure;
+    document.getElementById('proxy-total').innerText = data.proxies.total || 0;
+    document.getElementById('proxy-active').innerText = active;
+    document.getElementById('proxy-failed').innerText = failed;
+    document.getElementById('proxy-retrying').innerText = retrying;
+    document.getElementById('proxy-count').innerText = data.proxies.total || 0;
+    document.getElementById('proxy-available').innerText = available;
+	document.getElementById('proxy-list-count').innerText = available + active;
+
+    // Proxy List
+    const proxiesListDiv = document.getElementById('proxies-list');
+    proxiesListDiv.innerHTML = data.proxies_list.map(proxy => {
+        let statusClass = '';
+        if (proxy.status === 'active') statusClass = 'active';
+        if (proxy.status === 'failed') statusClass = 'failed';
+        if (proxy.status === 'retrying') statusClass = 'retrying';
+        if (proxy.status === 'available') statusClass = 'available';
+        return `<div class="proxy-item ${statusClass}"><strong>${proxy.proxy}</strong> - ${proxy.status.toUpperCase()}<span class="badge bg-light text-dark float-end">${proxy.retries || 0} retries</span></div>`;
+    }).join('');
+
+    // Config
+    const configDetailsDiv = document.getElementById('config-details');
+    configDetailsDiv.innerHTML = Object.entries(data.config || {})
+        .map(([key, value]) => `<div><strong>${key}</strong>: <code>${value}</code></div>`)
+        .join('');
+
+    // Current Emails
+    const currentEmailsDiv = document.getElementById('current-emails');
+    currentEmailsDiv.innerHTML = data.current_emails.map(email => {
+        let statusClass = '';
+        if (email.status === 'Present') statusClass = 'status-present';
+        if (email.status === 'Not Present') statusClass = 'status-failure';
+        if (email.status === 'Retrying') statusClass = 'status-retrying';
+        return `<div class="email-item ${statusClass}">${email.email}: ${email.status}</div>`;
+    }).join('');
+    document.getElementById('current-count').innerText = data.current_emails.length;
+
+    // Email Rates
+    const emailsPerSecond = (data.processed / data.uptime) || 0;
+    document.getElementById('emails-hour').innerText = Math.round(emailsPerSecond * 3600);
+    document.getElementById('emails-day').innerText = Math.round(emailsPerSecond * 86400);
+    document.getElementById('emails-week').innerText = Math.round(emailsPerSecond * 604800);
+    document.getElementById('emails-month').innerText = Math.round(emailsPerSecond * 2592000);
+
+    // Finishing Time
+    const remainingEmails = data.total_emails - data.processed;
+    let finishingTime = 'N/A';
+    if (emailsPerSecond > 0) {
+        const secondsLeft = remainingEmails / emailsPerSecond;
+        const hours = Math.floor(secondsLeft / 3600);
+        const minutes = Math.floor((secondsLeft % 3600) / 60);
+        finishingTime = `${hours}h ${minutes}m`;
+    }
+    document.getElementById('finishing-time').innerText = finishingTime;
+});
+</script>
+</body>
+</html>

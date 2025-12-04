@@ -1,0 +1,448 @@
+import time
+import threading
+import queue
+from flask import Flask, render_template
+from flask_socketio import SocketIO
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, WebDriverException
+from urllib.parse import urlparse
+import random
+from collections import defaultdict, deque  # Added deque for turbo proxies
+
+app = Flask(__name__)
+socketio = SocketIO(app)
+
+class Config:
+    CONCURRENT_BROWSERS = 10
+    AMAZON_URL = 'https://brandregistry.amazon.com/'
+    PROXY_FILE = 'google_valid_proxies.txt'
+    DATA_FILE = 'data.txt'
+    HEADLESS_MODE = 0
+    PAGE_LOAD_TIMEOUT = 10
+    ELEMENT_TIMEOUT_SHORT = 3
+    ELEMENT_TIMEOUT = 5
+    PROXY_MAX_RETRIES = 0
+    CURRENT_EMAILS_TTL = 10
+    CURRENT_EMAILS_DISPLAY_LIMIT = 10
+    STATUS_UPDATE_INTERVAL = 1
+    SITE_LETTER = 'A'
+    TURBO_MODE = True  # Enable turbo mode globally
+
+# Thread-safe variables
+email_queue = queue.Queue()
+processed_emails = set()
+success_count = 0
+failure_count = 0
+start_time = time.time()
+current_emails = []
+proxy_stats = {'total': 0, 'active': 0, 'failed': 0, 'retrying': 0}
+attempted_proxies = defaultdict(set)
+lock = threading.Lock()
+proxy_info = {}
+total_emails = 0
+
+# Turbo mode variables
+turbo_proxies = deque()  # Prioritized proxies
+turbo_lock = threading.Lock()  # Lock for thread-safe access
+
+class ProxyError(Exception):
+    pass
+
+def update_status():
+    while True:
+        elapsed = time.time() - start_time
+        with lock:
+            proxies_list = []
+            retrying_count = 0
+            for proxy in proxy_info:
+                status = proxy_info[proxy]['state']
+                retries = proxy_info[proxy].get('retries', 0)
+                if status == 'retrying':
+                    retrying_count += 1
+                proxies_list.append({
+                    'proxy': proxy,
+                    'status': status,
+                    'retries': retries
+                })
+            now = time.time()
+            current_emails[:] = [e for e in current_emails if now - e.get('timestamp', 0) < Config.CURRENT_EMAILS_TTL]
+            
+            # Determine if currently in Turbo Mode
+            with turbo_lock:
+                in_turbo_mode = Config.TURBO_MODE and len(turbo_proxies) > 0
+            
+            # Prepare Config values to send
+            config_data = {
+                'CONCURRENT_BROWSERS': Config.CONCURRENT_BROWSERS,
+                'AMAZON_URL': Config.AMAZON_URL,
+                'PROXY_FILE': Config.PROXY_FILE,
+                'DATA_FILE': Config.DATA_FILE,
+                'HEADLESS_MODE': 'Enabled' if Config.HEADLESS_MODE else 'Disabled',
+                'PAGE_LOAD_TIMEOUT': Config.PAGE_LOAD_TIMEOUT,
+                'ELEMENT_TIMEOUT_SHORT': Config.ELEMENT_TIMEOUT_SHORT,
+                'ELEMENT_TIMEOUT': Config.ELEMENT_TIMEOUT,
+                'PROXY_MAX_RETRIES': Config.PROXY_MAX_RETRIES,
+                'CURRENT_EMAILS_TTL': Config.CURRENT_EMAILS_TTL,
+                'CURRENT_EMAILS_DISPLAY_LIMIT': Config.CURRENT_EMAILS_DISPLAY_LIMIT,
+                'STATUS_UPDATE_INTERVAL': Config.STATUS_UPDATE_INTERVAL,
+                'SITE_LETTER': Config.SITE_LETTER,
+                'TURBO_MODE': 'Enabled' if Config.TURBO_MODE else 'Disabled'
+            }
+
+            status_data = {
+                'status': 'running',
+                'total_emails': total_emails,
+                'processed': len(processed_emails),
+                'success': success_count,
+                'failure': failure_count,
+                'proxies': {
+                    'total': proxy_stats['total'],
+                    'active': proxy_stats['active'],
+                    'failed': proxy_stats['failed'],
+                    'retrying': retrying_count
+                },
+                'proxies_list': proxies_list,
+                'current_emails': current_emails[:Config.CURRENT_EMAILS_DISPLAY_LIMIT],
+                'uptime': round(elapsed, 2),
+                'in_turbo_mode': in_turbo_mode,
+                'config': config_data
+            }
+        socketio.emit('update', status_data)
+        socketio.sleep(Config.STATUS_UPDATE_INTERVAL)
+
+def test_amazon(proxy, email):
+    global success_count, failure_count
+    chrome_options = Options()
+    chrome_options.add_argument(f'--proxy-server={proxy}')
+    chrome_options.add_argument('--disable-gpu')
+    chrome_options.add_argument('--no-sandbox')
+    chrome_options.add_argument('--disable-dev-shm-usage')
+    chrome_options.add_argument('--log-level=3')
+    if Config.HEADLESS_MODE:
+        chrome_options.add_argument('--headless')
+    driver = None
+    try:
+        driver = webdriver.Chrome(options=chrome_options)
+        driver.set_page_load_timeout(Config.PAGE_LOAD_TIMEOUT)
+        driver.get(Config.AMAZON_URL)
+        with lock:
+            current_emails.append({
+                'email': email,
+                'status': 'Checking...',
+                'timestamp': time.time()
+            })
+        if 'amazon' not in urlparse(driver.current_url).netloc:
+            raise ProxyError(f"Proxy {proxy} redirected to invalid domain", first_attempt=True)
+        try:
+            email_field = WebDriverWait(driver, Config.ELEMENT_TIMEOUT_SHORT).until(
+                EC.presence_of_element_located((By.ID, 'ap_email'))
+            )
+        except TimeoutException:
+            raise ProxyError(f"ap_email not found via {proxy}", first_attempt=True)
+        with lock:
+            proxy_info[proxy]['state'] = 'active'
+            proxy_info[proxy]['retries'] = 0
+            proxy_stats['active'] = sum(1 for p in proxy_info.values() if p['state'] == 'active')
+            proxy_stats['failed'] = sum(1 for p in proxy_info.values() if p['state'] == 'failed')
+            proxy_stats['retrying'] = sum(1 for p in proxy_info.values() if p['state'] == 'retrying')
+            if Config.TURBO_MODE:
+                with turbo_lock:
+                    if proxy not in turbo_proxies:
+                        turbo_proxies.append(proxy)
+        email_field.clear()
+        email_field.send_keys(email)
+        submit_btn = WebDriverWait(driver, Config.ELEMENT_TIMEOUT).until(
+            EC.element_to_be_clickable((By.ID, 'continue'))
+        )
+        submit_btn.click()
+        WebDriverWait(driver, Config.ELEMENT_TIMEOUT).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, 'body'))
+        )
+        error_found = False
+        try:
+            error_box = driver.find_element(By.ID, 'auth-error-message-box')
+            error_found = error_box.is_displayed()
+        except:
+            pass
+        if error_found:
+            with lock:
+                failure_count += 1
+                for e in current_emails:
+                    if e['email'] == email:
+                        e.update({'status': 'Not Present', 'timestamp': time.time()})
+                        break
+            return False
+        valid_found = False
+        valid_element_ids = ["ap_change_login_claim", "a-autoid-0-announce"]
+        for element_id in valid_element_ids:
+            try:
+                element = driver.find_element(By.ID, element_id)
+                if element.is_displayed():
+                    valid_found = True
+                    break
+            except:
+                continue
+        if valid_found:
+            with lock:
+                success_count += 1
+                for e in current_emails:
+                    if e['email'] == email:
+                        e.update({'status': 'Present', 'timestamp': time.time()})
+                        break
+            return True
+        raise ProxyError("Neither auth-error nor valid elements found after submission")
+    except ProxyError as e:
+        with lock:
+            if proxy in proxy_info:
+                first_attempt = getattr(e, 'first_attempt', False)
+                if first_attempt and proxy_info[proxy]['state'] == 'available':
+                    proxy_info[proxy]['state'] = 'failed'
+                    proxy_stats['failed'] += 1
+                else:
+                    proxy_info[proxy]['retries'] += 1
+                    proxy_info[proxy]['state'] = 'retrying'
+                    proxy_stats['retrying'] = sum(1 for p in proxy_info.values() if p['state'] == 'retrying')
+                    if proxy_info[proxy]['retries'] >= Config.PROXY_MAX_RETRIES:
+                        if proxy_info[proxy]['state'] == 'active':
+                            proxy_stats['active'] -= 1
+                        proxy_info[proxy]['state'] = 'failed'
+                        proxy_stats['failed'] += 1
+                proxy_stats['active'] = sum(1 for p in proxy_info.values() if p['state'] == 'active')
+                proxy_stats['failed'] = sum(1 for p in proxy_info.values() if p['state'] == 'failed')
+                proxy_stats['retrying'] = sum(1 for p in proxy_info.values() if p['state'] == 'retrying')
+        if Config.TURBO_MODE:
+            with turbo_lock:
+                if proxy in turbo_proxies and proxy_info[proxy]['state'] != 'active':
+                    turbo_proxies.remove(proxy)
+        raise
+    except Exception as e:
+        with lock:
+            if proxy in proxy_info:
+                proxy_info[proxy]['retries'] += 1
+                proxy_info[proxy]['state'] = 'retrying'
+                proxy_stats['retrying'] = sum(1 for p in proxy_info.values() if p['state'] == 'retrying')
+                if proxy_info[proxy]['retries'] >= Config.PROXY_MAX_RETRIES:
+                    if proxy_info[proxy]['state'] == 'active':
+                        proxy_stats['active'] -= 1
+                    proxy_info[proxy]['state'] = 'failed'
+                    proxy_stats['failed'] += 1
+                proxy_stats['active'] = sum(1 for p in proxy_info.values() if p['state'] == 'active')
+                proxy_stats['failed'] = sum(1 for p in proxy_info.values() if p['state'] == 'failed')
+                proxy_stats['retrying'] = sum(1 for p in proxy_info.values() if p['state'] == 'retrying')
+        if Config.TURBO_MODE:
+            with turbo_lock:
+                if proxy in turbo_proxies and proxy_info[proxy]['state'] != 'active':
+                    turbo_proxies.remove(proxy)
+        raise ProxyError(f"Unexpected error with proxy {proxy}: {str(e)}")
+    finally:
+        if driver:
+            driver.quit()
+
+def load_proxies():
+    with open(Config.PROXY_FILE, 'r') as f:
+        current_proxies = [line.strip() for line in f if line.strip()]
+    existing_proxies = set(proxy_info.keys())
+    new_proxies = [p for p in current_proxies if p not in existing_proxies]
+    for proxy in new_proxies:
+        proxy_info[proxy] = {'state': 'available', 'retries': 0}
+    proxies_to_remove = existing_proxies - set(current_proxies)
+    for proxy in proxies_to_remove:
+        del proxy_info[proxy]
+        if Config.TURBO_MODE:
+            with turbo_lock:
+                if proxy in turbo_proxies:
+                    turbo_proxies.remove(proxy)
+    proxy_stats['total'] = len(proxy_info)
+    proxy_stats['active'] = sum(1 for p in proxy_info.values() if p['state'] == 'active')
+    proxy_stats['failed'] = sum(1 for p in proxy_info.values() if p['state'] == 'failed')
+    # Add active proxies to turbo mode
+    if Config.TURBO_MODE:
+        for proxy in proxy_info:
+            if proxy_info[proxy]['state'] == 'active':
+                with turbo_lock:
+                    if proxy not in turbo_proxies:
+                        turbo_proxies.append(proxy)
+    print(f"[PROXY] Loaded {len(new_proxies)} new proxies (Total: {proxy_stats['total']}, Active: {proxy_stats['active']})")
+
+def worker():
+    while True:
+        line = email_queue.get()
+        if line is None:
+            email_queue.task_done()
+            break
+        try:
+            parts = line.split('|', 1)
+            if not parts:
+                email_queue.task_done()
+                continue
+            email_part = parts[0].strip()
+            rest = parts[1] if len(parts) > 1 else ''
+            tag_parts = rest.split('|') if rest else []
+            tag_dict = {}
+            for tag in tag_parts:
+                if ':' in tag:
+                    k, v = tag.split(':', 1)
+                    k = k.strip()
+                    tag_dict[k] = {'value': v.strip(), 'raw': tag}
+            with lock:
+                if email_part in processed_emails:
+                    continue
+                available_turbo = []
+                available_normal = []
+                if Config.TURBO_MODE:
+                    with turbo_lock:
+                        available_turbo = [p for p in turbo_proxies if proxy_info.get(p, {}).get('state') == 'active' and p not in attempted_proxies.get(email_part, set())]
+                available_normal = [p for p in proxy_info
+                                    if proxy_info[p]['state'] in ('available', 'active')
+                                    and p not in attempted_proxies.get(email_part, set())
+                                    and p not in available_turbo]
+                available = available_turbo + available_normal
+                if not available:
+                    print("[PROXY] Reloading proxies...")
+                    load_proxies()
+                    available_turbo = []
+                    available_normal = []
+                    if Config.TURBO_MODE:
+                        with turbo_lock:
+                            available_turbo = [p for p in turbo_proxies if proxy_info.get(p, {}).get('state') == 'active' and p not in attempted_proxies.get(email_part, set())]
+                    available_normal = [p for p in proxy_info
+                                        if proxy_info[p]['state'] in ('available', 'active')
+                                        and p not in attempted_proxies.get(email_part, set())
+                                        and p not in available_turbo]
+                    available = available_turbo + available_normal
+                    if not available:
+                        need_to_loop = True
+                    else:
+                        need_to_loop = False
+                else:
+                    need_to_loop = False
+            if need_to_loop:
+                while True:
+                    print("[PROXY] No proxies available. Waiting 10 seconds before retrying...")
+                    time.sleep(10)
+                    with lock:
+                        load_proxies()
+                        available_turbo = []
+                        available_normal = []
+                        if Config.TURBO_MODE:
+                            with turbo_lock:
+                                available_turbo = [p for p in turbo_proxies if proxy_info.get(p, {}).get('state') == 'active' and p not in attempted_proxies.get(email_part, set())]
+                        available_normal = [p for p in proxy_info
+                                            if proxy_info[p]['state'] in ('available', 'active')
+                                            and p not in attempted_proxies.get(email_part, set())
+                                            and p not in available_turbo]
+                    if available_turbo or available_normal:
+                        break
+            with lock:
+                if Config.TURBO_MODE and available_turbo:
+                    proxy = random.choice(available_turbo)
+                elif available_normal:
+                    proxy = random.choice(available_normal)
+                else:
+                    proxy = None
+                attempted_proxies[email_part].add(proxy)
+                status = 'Retrying' if len(attempted_proxies[email_part]) > 1 else 'Checking...'
+                current_emails.append({
+                    'email': email_part,
+                    'status': status,
+                    'timestamp': time.time()
+                })
+            found = test_amazon(proxy, email_part)
+            site_letter = Config.SITE_LETTER
+            if site_letter in tag_dict:
+                tag_dict[site_letter]['value'] = '1' if found else '0'
+            else:
+                email_queue.task_done()
+                with lock:
+                    processed_emails.add(email_part)
+                continue
+            original_email_part = parts[0]
+            updated_tag_parts = []
+            for tag in tag_parts:
+                if ':' in tag:
+                    k, v = tag.split(':', 1)
+                    k = k.strip()
+                    if k == site_letter:
+                        new_value = tag_dict[k]['value']
+                        updated_tag_parts.append(f"{k}:{new_value}")
+                    else:
+                        updated_tag_parts.append(tag)
+                else:
+                    updated_tag_parts.append(tag)
+            updated_line = original_email_part + '|' + '|'.join(updated_tag_parts)
+            with lock:
+                with open(Config.DATA_FILE, 'r') as f:
+                    all_lines = [l.rstrip('\n') for l in f]
+                try:
+                    idx = all_lines.index(line)
+                    all_lines[idx] = updated_line
+                    with open(Config.DATA_FILE, 'w') as f:
+                        for l in all_lines:
+                            f.write(l + '\n')
+                except ValueError:
+                    print(f"[ERROR] Line not found in file: {line}")
+            with lock:
+                processed_emails.add(email_part)
+        except ProxyError:
+            with lock:
+                if email_part not in processed_emails:
+                    email_queue.put(line)
+        except Exception as e:
+            print(f"[ERROR] {str(e)}")
+            with lock:
+                if email_part not in processed_emails:
+                    email_queue.put(line)
+        finally:
+            email_queue.task_done()
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+def background_thread():
+    global total_emails
+    try:
+        with open(Config.DATA_FILE, 'r') as f:
+            all_lines = [line.rstrip('\n') for line in f if line.strip()]
+        site_letter = Config.SITE_LETTER
+        emails_to_process = []
+        for line in all_lines:
+            parts = line.split('|', 1)
+            if not parts:
+                continue
+            email_part = parts[0]
+            rest = parts[1] if len(parts) > 1 else ''
+            tag_parts = rest.split('|') if rest else []
+            tag_dict = {}
+            for tag in tag_parts:
+                if ':' in tag:
+                    k, v = tag.split(':', 1)
+                    k = k.strip()
+                    tag_dict[k] = v.strip()
+            if site_letter in tag_dict and tag_dict[site_letter] == 'X':
+                emails_to_process.append(line)
+        total_emails = len(emails_to_process)
+        load_proxies()
+        threads = []
+        for _ in range(Config.CONCURRENT_BROWSERS):
+            t = threading.Thread(target=worker)
+            t.start()
+            threads.append(t)
+        for line in emails_to_process:
+            email_queue.put(line)
+        email_queue.join()
+        for _ in range(Config.CONCURRENT_BROWSERS):
+            email_queue.put(None)
+        for t in threads:
+            t.join()
+    except Exception as e:
+        socketio.emit('error', {'message': str(e)})
+
+if __name__ == '__main__':
+    threading.Thread(target=background_thread).start()
+    threading.Thread(target=update_status).start()
+    socketio.run(app, debug=False)
