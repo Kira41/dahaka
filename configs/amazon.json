@@ -1,0 +1,53 @@
+{
+  "name": "amazon",
+  "description": "Automation steps for Amazon Brand Registry login email presence check.",
+  "site_letter": "A",
+  "entrypoint": "https://brandregistry.amazon.com/",
+  "files": {
+    "proxy_file": "google_valid_proxies.txt",
+    "data_file": "data.txt"
+  },
+  "browser": {
+    "headless": false,
+    "page_load_timeout_seconds": 10
+  },
+  "timeouts": {
+    "element_timeout_short_seconds": 3,
+    "element_timeout_seconds": 5
+  },
+  "concurrency": {
+    "workers": 10
+  },
+  "selectors": {
+    "email_field": { "by": "id", "value": "ap_email" },
+    "continue_button": { "by": "id", "value": "continue" },
+    "page_ready": { "by": "css_selector", "value": "body" },
+    "error_indicator": { "by": "id", "value": "auth-error-message-box" },
+    "valid_indicators": [
+      { "by": "id", "value": "ap_change_login_claim" },
+      { "by": "id", "value": "a-autoid-0-announce" }
+    ]
+  },
+  "flow": [
+    { "action": "navigate", "target": "{{ entrypoint }}" },
+    { "action": "wait_for", "selector": "email_field", "timeout": "element_timeout_short_seconds" },
+    { "action": "input", "selector": "email_field", "source": "email" },
+    { "action": "wait_for", "selector": "continue_button", "timeout": "element_timeout_seconds" },
+    { "action": "click", "selector": "continue_button" },
+    { "action": "wait_for", "selector": "page_ready", "timeout": "element_timeout_seconds" },
+    {
+      "action": "determine_presence",
+      "logic": [
+        {
+          "condition": { "action": "exists_and_displayed", "selector": "error_indicator" },
+          "result": "absent"
+        },
+        {
+          "condition": { "action": "any_exists_and_displayed", "selectors": "valid_indicators" },
+          "result": "present"
+        }
+      ],
+      "fallback_result": "unknown"
+    }
+  ]
+}
