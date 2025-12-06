@@ -30,7 +30,7 @@
   },
   "flow": [
     { "action": "navigate", "target": "{{ entrypoint }}" },
-    { "action": "wait_for", "selector": "email_field", "timeout": "element_timeout_short_seconds" },
+    { "action": "wait_for", "selector": "email_field", "timeout": "element_timeout_short_seconds", "first_attempt": true },
     { "action": "input", "selector": "email_field", "source": "email" },
     { "action": "wait_for", "selector": "continue_button", "timeout": "element_timeout_seconds" },
     { "action": "click", "selector": "continue_button" },

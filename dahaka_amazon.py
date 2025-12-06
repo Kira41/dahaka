@@ -1,36 +1,50 @@
-import time
+import json
+import os
+import random
 import threading
+import time
+from collections import defaultdict, deque  # Added deque for turbo proxies
+from urllib.parse import urlparse
 import queue
+
 from flask import Flask, render_template
 from flask_socketio import SocketIO
 from selenium import webdriver
+from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, WebDriverException
-from urllib.parse import urlparse
-import random
-from collections import defaultdict, deque  # Added deque for turbo proxies
+from selenium.webdriver.support.ui import WebDriverWait
+
+CONFIG_PATH = os.environ.get('AUTOMATION_CONFIG', 'configs/amazon.json')
+
+
+def load_automation_config(path: str):
+    with open(path, 'r') as f:
+        return json.load(f)
+
+
+automation_config = load_automation_config(CONFIG_PATH)
 
 app = Flask(__name__)
 socketio = SocketIO(app)
 
+
 class Config:
-    CONCURRENT_BROWSERS = 10
-    AMAZON_URL = 'https://brandregistry.amazon.com/'
-    PROXY_FILE = 'google_valid_proxies.txt'
-    DATA_FILE = 'data.txt'
-    HEADLESS_MODE = 0
-    PAGE_LOAD_TIMEOUT = 10
-    ELEMENT_TIMEOUT_SHORT = 3
-    ELEMENT_TIMEOUT = 5
-    PROXY_MAX_RETRIES = 0
-    CURRENT_EMAILS_TTL = 10
-    CURRENT_EMAILS_DISPLAY_LIMIT = 10
-    STATUS_UPDATE_INTERVAL = 1
-    SITE_LETTER = 'A'
-    TURBO_MODE = True  # Enable turbo mode globally
+    CONCURRENT_BROWSERS = automation_config.get('concurrency', {}).get('workers', 10)
+    AMAZON_URL = automation_config.get('entrypoint', 'https://brandregistry.amazon.com/')
+    PROXY_FILE = automation_config.get('files', {}).get('proxy_file', 'google_valid_proxies.txt')
+    DATA_FILE = automation_config.get('files', {}).get('data_file', 'data.txt')
+    HEADLESS_MODE = bool(automation_config.get('browser', {}).get('headless', 0))
+    PAGE_LOAD_TIMEOUT = automation_config.get('browser', {}).get('page_load_timeout_seconds', 10)
+    ELEMENT_TIMEOUT_SHORT = automation_config.get('timeouts', {}).get('element_timeout_short_seconds', 3)
+    ELEMENT_TIMEOUT = automation_config.get('timeouts', {}).get('element_timeout_seconds', 5)
+    PROXY_MAX_RETRIES = automation_config.get('proxy', {}).get('max_retries', 0)
+    CURRENT_EMAILS_TTL = automation_config.get('ui', {}).get('current_emails_ttl', 10)
+    CURRENT_EMAILS_DISPLAY_LIMIT = automation_config.get('ui', {}).get('current_emails_display_limit', 10)
+    STATUS_UPDATE_INTERVAL = automation_config.get('ui', {}).get('status_update_interval', 1)
+    SITE_LETTER = automation_config.get('site_letter', 'A')
+    TURBO_MODE = automation_config.get('turbo_mode', True)  # Enable turbo mode globally
 
 # Thread-safe variables
 email_queue = queue.Queue()
@@ -49,8 +63,83 @@ total_emails = 0
 turbo_proxies = deque()  # Prioritized proxies
 turbo_lock = threading.Lock()  # Lock for thread-safe access
 
+
+def selector_to_locator(selector):
+    by_mapping = {
+        'id': By.ID,
+        'css_selector': By.CSS_SELECTOR,
+        'xpath': By.XPATH,
+        'name': By.NAME,
+        'class_name': By.CLASS_NAME,
+        'tag_name': By.TAG_NAME,
+        'link_text': By.LINK_TEXT,
+        'partial_link_text': By.PARTIAL_LINK_TEXT,
+    }
+    by_value = selector.get('by')
+    if by_value not in by_mapping:
+        raise ValueError(f"Unsupported selector type: {by_value}")
+    return by_mapping[by_value], selector.get('value')
+
+
+def get_locators(selector_key, allow_multiple=False):
+    selector_def = automation_config.get('selectors', {}).get(selector_key)
+    if selector_def is None:
+        raise ValueError(f"Selector '{selector_key}' not found in config")
+    if isinstance(selector_def, list):
+        locators = [selector_to_locator(item) for item in selector_def]
+    else:
+        locators = [selector_to_locator(selector_def)]
+    if not allow_multiple and len(locators) > 1:
+        return [locators[0]]
+    return locators
+
+
+def resolve_timeout(timeout_value):
+    if isinstance(timeout_value, (int, float)):
+        return timeout_value
+    if isinstance(timeout_value, str):
+        timeout_candidates = {}
+        timeout_candidates.update(automation_config.get('timeouts', {}))
+        timeout_candidates.update(automation_config.get('browser', {}))
+        return timeout_candidates.get(timeout_value, Config.ELEMENT_TIMEOUT)
+    return Config.ELEMENT_TIMEOUT
+
+
+def evaluate_condition(driver, condition):
+    action = condition.get('action')
+    if action == 'exists_and_displayed':
+        locator = get_locators(condition.get('selector'), allow_multiple=False)[0]
+        try:
+            element = driver.find_element(*locator)
+            return element.is_displayed()
+        except Exception:
+            return False
+    if action == 'any_exists_and_displayed':
+        locators = get_locators(condition.get('selectors'), allow_multiple=True)
+        for locator in locators:
+            try:
+                element = driver.find_element(*locator)
+                if element.is_displayed():
+                    return True
+            except Exception:
+                continue
+        return False
+    raise ValueError(f"Unsupported condition action: {action}")
+
+
+def determine_presence(driver, logic, fallback_result='unknown'):
+    for item in logic:
+        condition = item.get('condition', {})
+        result = item.get('result')
+        if evaluate_condition(driver, condition):
+            return result
+    return fallback_result
+
+
 class ProxyError(Exception):
-    pass
+    def __init__(self, message, first_attempt=False):
+        super().__init__(message)
+        self.first_attempt = first_attempt
 
 def update_status():
     while True:
@@ -128,73 +217,89 @@ def test_amazon(proxy, email):
     try:
         driver = webdriver.Chrome(options=chrome_options)
         driver.set_page_load_timeout(Config.PAGE_LOAD_TIMEOUT)
-        driver.get(Config.AMAZON_URL)
         with lock:
             current_emails.append({
                 'email': email,
                 'status': 'Checking...',
                 'timestamp': time.time()
             })
-        if 'amazon' not in urlparse(driver.current_url).netloc:
-            raise ProxyError(f"Proxy {proxy} redirected to invalid domain", first_attempt=True)
-        try:
-            email_field = WebDriverWait(driver, Config.ELEMENT_TIMEOUT_SHORT).until(
-                EC.presence_of_element_located((By.ID, 'ap_email'))
-            )
-        except TimeoutException:
-            raise ProxyError(f"ap_email not found via {proxy}", first_attempt=True)
-        with lock:
-            proxy_info[proxy]['state'] = 'active'
-            proxy_info[proxy]['retries'] = 0
-            proxy_stats['active'] = sum(1 for p in proxy_info.values() if p['state'] == 'active')
-            proxy_stats['failed'] = sum(1 for p in proxy_info.values() if p['state'] == 'failed')
-            proxy_stats['retrying'] = sum(1 for p in proxy_info.values() if p['state'] == 'retrying')
-            if Config.TURBO_MODE:
-                with turbo_lock:
-                    if proxy not in turbo_proxies:
-                        turbo_proxies.append(proxy)
-        email_field.clear()
-        email_field.send_keys(email)
-        submit_btn = WebDriverWait(driver, Config.ELEMENT_TIMEOUT).until(
-            EC.element_to_be_clickable((By.ID, 'continue'))
-        )
-        submit_btn.click()
-        WebDriverWait(driver, Config.ELEMENT_TIMEOUT).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, 'body'))
-        )
-        error_found = False
-        try:
-            error_box = driver.find_element(By.ID, 'auth-error-message-box')
-            error_found = error_box.is_displayed()
-        except:
-            pass
-        if error_found:
-            with lock:
-                failure_count += 1
-                for e in current_emails:
-                    if e['email'] == email:
-                        e.update({'status': 'Not Present', 'timestamp': time.time()})
-                        break
-            return False
-        valid_found = False
-        valid_element_ids = ["ap_change_login_claim", "a-autoid-0-announce"]
-        for element_id in valid_element_ids:
-            try:
-                element = driver.find_element(By.ID, element_id)
-                if element.is_displayed():
-                    valid_found = True
-                    break
-            except:
-                continue
-        if valid_found:
-            with lock:
-                success_count += 1
-                for e in current_emails:
-                    if e['email'] == email:
-                        e.update({'status': 'Present', 'timestamp': time.time()})
-                        break
-            return True
-        raise ProxyError("Neither auth-error nor valid elements found after submission")
+
+        for step in automation_config.get('flow', []):
+            action = step.get('action')
+            if action == 'navigate':
+                target = step.get('target', Config.AMAZON_URL)
+                target = target.replace('{{ entrypoint }}', Config.AMAZON_URL)
+                driver.get(target)
+                expected_host = urlparse(Config.AMAZON_URL).netloc
+                if expected_host and expected_host not in urlparse(driver.current_url).netloc:
+                    error = ProxyError(f"Proxy {proxy} redirected to invalid domain", first_attempt=True)
+                    raise error
+            elif action == 'wait_for':
+                locator = get_locators(step.get('selector'), allow_multiple=False)[0]
+                timeout = resolve_timeout(step.get('timeout'))
+                try:
+                    WebDriverWait(driver, timeout).until(
+                        EC.presence_of_element_located(locator)
+                    )
+                except TimeoutException:
+                    first_attempt = step.get('first_attempt', False)
+                    raise ProxyError(f"{step.get('selector')} not found via {proxy}", first_attempt=first_attempt)
+                with lock:
+                    proxy_info[proxy]['state'] = 'active'
+                    proxy_info[proxy]['retries'] = 0
+                    proxy_stats['active'] = sum(1 for p in proxy_info.values() if p['state'] == 'active')
+                    proxy_stats['failed'] = sum(1 for p in proxy_info.values() if p['state'] == 'failed')
+                    proxy_stats['retrying'] = sum(1 for p in proxy_info.values() if p['state'] == 'retrying')
+                    if Config.TURBO_MODE:
+                        with turbo_lock:
+                            if proxy not in turbo_proxies:
+                                turbo_proxies.append(proxy)
+            elif action == 'input':
+                locator = get_locators(step.get('selector'), allow_multiple=False)[0]
+                try:
+                    element = WebDriverWait(driver, Config.ELEMENT_TIMEOUT).until(
+                        EC.presence_of_element_located(locator)
+                    )
+                    element.clear()
+                    if step.get('source') == 'email':
+                        element.send_keys(email)
+                except TimeoutException:
+                    raise ProxyError(f"Input field {step.get('selector')} not found via {proxy}")
+            elif action == 'click':
+                locator = get_locators(step.get('selector'), allow_multiple=False)[0]
+                try:
+                    button = WebDriverWait(driver, Config.ELEMENT_TIMEOUT).until(
+                        EC.element_to_be_clickable(locator)
+                    )
+                    button.click()
+                except TimeoutException:
+                    raise ProxyError(f"Clickable element {step.get('selector')} not found via {proxy}")
+            elif action == 'determine_presence':
+                presence_result = determine_presence(
+                    driver,
+                    step.get('logic', []),
+                    fallback_result=step.get('fallback_result', 'unknown')
+                )
+                if presence_result == 'absent':
+                    with lock:
+                        failure_count += 1
+                        for e in current_emails:
+                            if e['email'] == email:
+                                e.update({'status': 'Not Present', 'timestamp': time.time()})
+                                break
+                    return False
+                if presence_result == 'present':
+                    with lock:
+                        success_count += 1
+                        for e in current_emails:
+                            if e['email'] == email:
+                                e.update({'status': 'Present', 'timestamp': time.time()})
+                                break
+                    return True
+                raise ProxyError("Unable to determine presence from configuration")
+            else:
+                raise ValueError(f"Unsupported action: {action}")
+        raise ProxyError("Flow completed without determine_presence step")
     except ProxyError as e:
         with lock:
             if proxy in proxy_info:
