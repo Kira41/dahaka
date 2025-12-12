@@ -18,7 +18,8 @@ requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 CONFIG = {
     # Proxy sources
     "API_URL": "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=all",
-    "TEST_URL": "https://www.google.com",
+    # Use an HTTP endpoint to avoid HTTPS CONNECT failures with HTTP-only proxies
+    "TEST_URL": "http://example.com",
     
     # Proxy parameters
     "PROXY_TIMEOUT": 10,          # Seconds for proxy to respond
@@ -70,6 +71,8 @@ logging.basicConfig(
     format=CONFIG["LOGGING"]["FORMAT"],
     handlers=[logging.StreamHandler()]
 )
+# Silence noisy retry warnings from urllib3 when proxies fail
+logging.getLogger("urllib3").setLevel(logging.ERROR)
 
 def get_proxies_from_api():
     """Fetch proxy list from API"""
