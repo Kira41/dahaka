@@ -8,6 +8,8 @@ from collections import defaultdict, deque  # Added deque for turbo proxies
 from urllib.parse import urlparse
 import queue
 
+import requests
+
 from flask import Flask, jsonify, render_template, request
 from flask_socketio import SocketIO
 from selenium import webdriver
@@ -76,7 +78,11 @@ class Config:
         cls.PAGE_LOAD_TIMEOUT = config.get('browser', {}).get('page_load_timeout_seconds', 10)
         cls.ELEMENT_TIMEOUT_SHORT = config.get('timeouts', {}).get('element_timeout_short_seconds', 3)
         cls.ELEMENT_TIMEOUT = config.get('timeouts', {}).get('element_timeout_seconds', 5)
-        cls.PROXY_MAX_RETRIES = config.get('proxy', {}).get('max_retries', 0)
+        proxy_config = config.get('proxy', {})
+        cls.PROXY_MAX_RETRIES = proxy_config.get('max_retries', 0)
+        cls.PROXY_VALIDATION_URL = proxy_config.get('validation_url', cls.ENTRYPOINT_URL)
+        cls.PROXY_VALIDATION_TIMEOUT = proxy_config.get('validation_timeout_seconds', 8)
+        cls.PROXY_VALIDATION_WORKERS = proxy_config.get('validation_workers', max(1, min(20, cls.CONCURRENT_BROWSERS * 2)))
         cls.CURRENT_EMAILS_TTL = config.get('ui', {}).get('current_emails_ttl', 10)
         cls.CURRENT_EMAILS_DISPLAY_LIMIT = config.get('ui', {}).get('current_emails_display_limit', 10)
         cls.STATUS_UPDATE_INTERVAL = config.get('ui', {}).get('status_update_interval', 1)
@@ -536,13 +542,58 @@ def test_site(proxy, email):
         if driver:
             driver.quit()
 
+
+def _validate_proxy(proxy):
+    test_url = Config.PROXY_VALIDATION_URL or Config.ENTRYPOINT_URL
+    try:
+        start_time = time.time()
+        response = requests.get(
+            test_url,
+            proxies={"http": proxy, "https": proxy},
+            timeout=Config.PROXY_VALIDATION_TIMEOUT,
+        )
+        latency = time.time() - start_time
+        if response.status_code != 200:
+            logging.debug("Proxy %s failed validation with status %s", proxy, response.status_code)
+            return None
+        expected_host = urlparse(Config.ENTRYPOINT_URL).netloc
+        if expected_host and expected_host not in urlparse(response.url).netloc:
+            logging.debug("Proxy %s redirected to %s instead of %s", proxy, response.url, expected_host)
+            return None
+        return latency
+    except Exception as exc:
+        logging.debug("Proxy %s failed validation: %s", proxy, exc)
+        return None
+
+
+def validate_new_proxies(proxies):
+    if not proxies:
+        return {}
+    workers = min(len(proxies), Config.PROXY_VALIDATION_WORKERS)
+    valid = {}
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_proxy = {executor.submit(_validate_proxy, proxy): proxy for proxy in proxies}
+        for future in as_completed(future_to_proxy):
+            proxy = future_to_proxy[future]
+            latency = future.result()
+            if latency is not None:
+                valid[proxy] = latency
+            else:
+                logging.info("[PROXY] Dropping %s - failed validation", proxy)
+    logging.info("[PROXY] Validation complete: %s/%s proxies usable", len(valid), len(proxies))
+    return valid
+
+
 def load_proxies():
     with open(Config.PROXY_FILE, 'r') as f:
         current_proxies = [line.strip() for line in f if line.strip()]
     existing_proxies = set(proxy_info.keys())
     new_proxies = [p for p in current_proxies if p not in existing_proxies]
+    validation_results = validate_new_proxies(new_proxies)
     for proxy in new_proxies:
-        proxy_info[proxy] = {'state': 'available', 'retries': 0}
+        if proxy not in validation_results:
+            continue
+        proxy_info[proxy] = {'state': 'available', 'retries': 0, 'latency': validation_results[proxy]}
     proxies_to_remove = existing_proxies - set(current_proxies)
     for proxy in proxies_to_remove:
         del proxy_info[proxy]
