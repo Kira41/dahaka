@@ -1,5 +1,6 @@
 import logging
 import random
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -167,27 +168,71 @@ def save_proxies(new_proxies):
     except Exception as e:
         logging.error(f"Error saving proxies: {e}")
 
+
+def load_existing_proxies():
+    """Load already saved proxies into a set."""
+    try:
+        with open(CONFIG["OUTPUT_FILE"], "r") as f:
+            return set(f.read().splitlines())
+    except FileNotFoundError:
+        return set()
+    except Exception as e:
+        logging.error(f"Error loading proxies: {e}")
+        return set()
+
+
+def save_proxy_realtime(proxy, saved_proxies, lock):
+    """Persist a single proxy immediately, ensuring deduplication across threads."""
+    with lock:
+        if proxy in saved_proxies:
+            return False
+
+        saved_proxies.add(proxy)
+        try:
+            with open(CONFIG["OUTPUT_FILE"], "a") as f:
+                f.write(f"{proxy}\n")
+            logging.info(
+                f"Persisted proxy {proxy} | Total saved: {len(saved_proxies)}"
+            )
+        except Exception as e:
+            logging.error(f"Error saving proxy {proxy}: {e}")
+        return True
+
 def main():
+    saved_proxies = load_existing_proxies()
+    save_lock = threading.Lock()
+
     while True:
+        cycle_start = time.time()
         proxies = get_proxies_from_api()
-        valid_proxies = []
-        
+        total_proxies = len(proxies)
+        tested_count = 0
+        new_valid_count = 0
+
         with ThreadPoolExecutor(max_workers=CONFIG["MAX_WORKERS"]) as executor:
             future_to_proxy = {executor.submit(test_proxy, p): p for p in proxies}
-            
+
             for future in as_completed(future_to_proxy):
+                tested_count += 1
                 result = future.result()
                 if result:
                     proxy, latency = result
-                    valid_proxies.append(proxy)
+                    if save_proxy_realtime(proxy, saved_proxies, save_lock):
+                        new_valid_count += 1
                     logging.info(
                         f"Valid proxy found: {proxy} "
                         f"({CONFIG['COLORS']['SUCCESS']}{latency:.2f}s{CONFIG['COLORS']['RESET']})"
                     )
 
-        if valid_proxies:
-            save_proxies(valid_proxies)
-        
+        logging.info(
+            "Cycle stats | fetched: %s | tested: %s | new valid: %s | total saved: %s | duration: %.2fs",
+            total_proxies,
+            tested_count,
+            new_valid_count,
+            len(saved_proxies),
+            time.time() - cycle_start,
+        )
+
         logging.info(f"Waiting {CONFIG['RETRY_INTERVAL']} seconds before next check...")
         time.sleep(CONFIG["RETRY_INTERVAL"])
 
