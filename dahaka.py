@@ -77,6 +77,7 @@ attempted_proxies = defaultdict(set)
 lock = threading.Lock()
 proxy_info = {}
 total_emails = 0
+stop_event = threading.Event()
 
 # Turbo mode variables
 turbo_proxies = deque()  # Prioritized proxies
@@ -102,6 +103,7 @@ def reset_runtime_state():
     attempted_proxies = defaultdict(set)
     proxy_info = {}
     total_emails = 0
+    stop_event.clear()
     with turbo_lock:
         turbo_proxies.clear()
 
@@ -393,8 +395,15 @@ def update_status():
                 'TURBO_MODE': 'Enabled' if Config.TURBO_MODE else 'Disabled'
             }
 
+            if processing_thread and processing_thread.is_alive():
+                status_label = 'running'
+            elif stop_event.is_set():
+                status_label = 'stopped'
+            else:
+                status_label = 'idle'
+
             status_data = {
-                'status': 'running' if processing_thread and processing_thread.is_alive() else 'idle',
+                'status': status_label,
                 'total_emails': total_emails,
                 'processed': len(processed_emails),
                 'success': success_count,
@@ -531,9 +540,26 @@ def load_proxies():
                         turbo_proxies.append(proxy)
     print(f"[PROXY] Loaded {len(new_proxies)} new proxies (Total: {proxy_stats['total']}, Active: {proxy_stats['active']})")
 
+
+def drain_email_queue():
+    while True:
+        try:
+            email_queue.get_nowait()
+            email_queue.task_done()
+        except queue.Empty:
+            break
+
 def worker():
     while True:
-        line = email_queue.get()
+        if stop_event.is_set():
+            break
+        try:
+            line = email_queue.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        if stop_event.is_set():
+            email_queue.task_done()
+            break
         if line is None:
             email_queue.task_done()
             break
@@ -585,6 +611,8 @@ def worker():
                     need_to_loop = False
             if need_to_loop:
                 while True:
+                    if stop_event.is_set():
+                        break
                     print("[PROXY] No proxies available. Waiting 10 seconds before retrying...")
                     time.sleep(10)
                     with lock:
@@ -598,8 +626,10 @@ def worker():
                                             if proxy_info[p]['state'] in ('available', 'active')
                                             and p not in attempted_proxies.get(email_part, set())
                                             and p not in available_turbo]
-                    if available_turbo or available_normal:
+                    if available_turbo or available_normal or stop_event.is_set():
                         break
+                if stop_event.is_set():
+                    continue
             with lock:
                 if Config.TURBO_MODE and available_turbo:
                     proxy = random.choice(available_turbo)
@@ -614,6 +644,8 @@ def worker():
                     'status': status,
                     'timestamp': time.time()
                 })
+            if stop_event.is_set():
+                continue
             found = test_site(proxy, email_part)
             site_letter = Config.SITE_LETTER
             if site_letter in tag_dict:
@@ -675,6 +707,7 @@ def list_configs():
 def process_emails():
     global total_emails, processing_thread
     try:
+        stop_event.clear()
         with open(Config.DATA_FILE, 'r') as f:
             all_lines = [line.rstrip('\n') for line in f if line.strip()]
         site_letter = Config.SITE_LETTER
@@ -702,8 +735,13 @@ def process_emails():
             t.start()
             threads.append(t)
         for line in emails_to_process:
+            if stop_event.is_set():
+                break
             email_queue.put(line)
-        email_queue.join()
+        while not stop_event.is_set():
+            if email_queue.unfinished_tasks == 0:
+                break
+            time.sleep(0.1)
         for _ in range(Config.CONCURRENT_BROWSERS):
             email_queue.put(None)
         for t in threads:
@@ -711,6 +749,8 @@ def process_emails():
     except Exception as e:
         socketio.emit('error', {'message': str(e)})
     finally:
+        stop_event.set()
+        drain_email_queue()
         with processing_lock:
             processing_thread = None
 
@@ -731,6 +771,20 @@ def start_processing(message):
         processing_thread = threading.Thread(target=process_emails, daemon=True)
         processing_thread.start()
     socketio.emit('processing_started', {'config': active_config})
+
+
+@socketio.on('stop_processing')
+def stop_processing():
+    with processing_lock:
+        global processing_thread
+        if not processing_thread or not processing_thread.is_alive():
+            socketio.emit('error', {'message': 'Processing is not running.'})
+            return
+        stop_event.set()
+        drain_email_queue()
+        for _ in range(Config.CONCURRENT_BROWSERS):
+            email_queue.put(None)
+    socketio.emit('processing_stopped', {'config': active_config})
 
 
 if __name__ == '__main__':
