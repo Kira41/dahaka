@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 import queue
 
 import requests
+from requests.adapters import HTTPAdapter
 
 from flask import Flask, jsonify, render_template, request
 from flask_socketio import SocketIO
@@ -19,6 +20,7 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
+from urllib3.util import Retry
 
 
 def find_default_config_path():
@@ -85,6 +87,8 @@ class Config:
         cls.PROXY_VALIDATION_TIMEOUT = proxy_config.get('validation_timeout_seconds', 8)
         cls.PROXY_VALIDATION_WORKERS = proxy_config.get('validation_workers', max(1, min(20, cls.CONCURRENT_BROWSERS * 2)))
         cls.PROXY_REVALIDATION_SECONDS = proxy_config.get('revalidation_seconds', 600)
+        cls.PROXY_VALIDATION_RETRIES = proxy_config.get('validation_retries', 2)
+        cls.PROXY_VALIDATION_BACKOFF = proxy_config.get('validation_backoff_seconds', 1)
         cls.CURRENT_EMAILS_TTL = config.get('ui', {}).get('current_emails_ttl', 10)
         cls.CURRENT_EMAILS_DISPLAY_LIMIT = config.get('ui', {}).get('current_emails_display_limit', 10)
         cls.STATUS_UPDATE_INTERVAL = config.get('ui', {}).get('status_update_interval', 1)
@@ -92,7 +96,28 @@ class Config:
         cls.TURBO_MODE = config.get('turbo_mode', True)  # Enable turbo mode globally
 
 
+def build_validation_session():
+    retry_strategy = Retry(
+        total=Config.PROXY_VALIDATION_RETRIES,
+        backoff_factor=Config.PROXY_VALIDATION_BACKOFF,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session = requests.Session()
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
+def refresh_validation_session():
+    global validation_session
+    validation_session = build_validation_session()
+
+
 Config.load_from_config(automation_config)
+validation_session = build_validation_session()
 
 # Thread-safe variables
 email_queue = queue.Queue()
@@ -163,6 +188,7 @@ def set_active_config(config_meta):
     global automation_config, active_config
     automation_config = load_automation_config(config_meta['path'])
     Config.load_from_config(automation_config)
+    refresh_validation_session()
     active_config = {
         'name': automation_config.get('name', config_meta.get('name')),
         'path': config_meta['path'],
@@ -417,6 +443,9 @@ def update_status():
                 'ELEMENT_TIMEOUT_SHORT': Config.ELEMENT_TIMEOUT_SHORT,
                 'ELEMENT_TIMEOUT': Config.ELEMENT_TIMEOUT,
                 'PROXY_MAX_RETRIES': Config.PROXY_MAX_RETRIES,
+                'PROXY_VALIDATION_RETRIES': Config.PROXY_VALIDATION_RETRIES,
+                'PROXY_VALIDATION_BACKOFF': Config.PROXY_VALIDATION_BACKOFF,
+                'PROXY_VALIDATION_TIMEOUT': Config.PROXY_VALIDATION_TIMEOUT,
                 'CURRENT_EMAILS_TTL': Config.CURRENT_EMAILS_TTL,
                 'CURRENT_EMAILS_DISPLAY_LIMIT': Config.CURRENT_EMAILS_DISPLAY_LIMIT,
                 'STATUS_UPDATE_INTERVAL': Config.STATUS_UPDATE_INTERVAL,
@@ -549,7 +578,7 @@ def _validate_proxy(proxy):
     test_url = Config.PROXY_VALIDATION_URL or Config.ENTRYPOINT_URL
     try:
         start_time = time.time()
-        response = requests.get(
+        response = validation_session.get(
             test_url,
             proxies={"http": proxy, "https": proxy},
             timeout=Config.PROXY_VALIDATION_TIMEOUT,
@@ -861,6 +890,12 @@ def update_config():
 
     proxy_section = automation_config.get('proxy', {}).copy()
     proxy_section['max_retries'] = payload.get('proxy_max_retries', proxy_section.get('max_retries', Config.PROXY_MAX_RETRIES))
+    proxy_section['validation_url'] = payload.get('proxy_validation_url', proxy_section.get('validation_url', Config.PROXY_VALIDATION_URL))
+    proxy_section['validation_timeout_seconds'] = payload.get('proxy_validation_timeout', proxy_section.get('validation_timeout_seconds', Config.PROXY_VALIDATION_TIMEOUT))
+    proxy_section['validation_workers'] = payload.get('proxy_validation_workers', proxy_section.get('validation_workers', Config.PROXY_VALIDATION_WORKERS))
+    proxy_section['revalidation_seconds'] = payload.get('proxy_revalidation_seconds', proxy_section.get('revalidation_seconds', Config.PROXY_REVALIDATION_SECONDS))
+    proxy_section['validation_retries'] = payload.get('proxy_validation_retries', proxy_section.get('validation_retries', Config.PROXY_VALIDATION_RETRIES))
+    proxy_section['validation_backoff_seconds'] = payload.get('proxy_validation_backoff', proxy_section.get('validation_backoff_seconds', Config.PROXY_VALIDATION_BACKOFF))
     automation_config['proxy'] = proxy_section
 
     ui_section = automation_config.get('ui', {}).copy()
@@ -872,6 +907,7 @@ def update_config():
     automation_config['turbo_mode'] = bool(payload.get('turbo_mode', automation_config.get('turbo_mode', Config.TURBO_MODE)))
 
     Config.load_from_config(automation_config)
+    refresh_validation_session()
     set_active_config({
         'name': automation_config.get('name', Config.CONFIG_NAME),
         'path': active_config['path'] if active_config else CONFIG_PATH,

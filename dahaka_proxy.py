@@ -1,9 +1,12 @@
-import requests
-import time
 import logging
-import colorama
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import colorama
+import requests
+from requests.adapters import HTTPAdapter
 from urllib3.exceptions import InsecureRequestWarning
+from urllib3.util import Retry
 
 # Initialize colorama
 colorama.init()
@@ -21,7 +24,9 @@ CONFIG = {
     "PROXY_TIMEOUT": 10,          # Seconds for proxy to respond
     "LATENCY_THRESHOLD": 7,       # Maximum acceptable latency in seconds
     "MAX_WORKERS": 100,           # Maximum parallel threads
-    
+    "REQUEST_RETRIES": 3,         # Number of retries for HTTP requests
+    "REQUEST_BACKOFF": 1,         # Backoff factor between retries
+
     # Application settings
     "OUTPUT_FILE": "google_valid_proxies.txt",
     "RETRY_INTERVAL": 5,         # Seconds between checks
@@ -41,6 +46,24 @@ CONFIG = {
     }
 }
 
+
+def build_session():
+    retry_strategy = Retry(
+        total=CONFIG["REQUEST_RETRIES"],
+        backoff_factor=CONFIG["REQUEST_BACKOFF"],
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session = requests.Session()
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
+http_session = build_session()
+
 # Configure logging
 logging.basicConfig(
     level=CONFIG["LOGGING"]["LEVEL"],
@@ -51,9 +74,10 @@ logging.basicConfig(
 def get_proxies_from_api():
     """Fetch proxy list from API"""
     try:
-        response = requests.get(
+        response = http_session.get(
             CONFIG["API_URL"],
-            verify=CONFIG["VERIFY_SSL"]
+            verify=CONFIG["VERIFY_SSL"],
+            timeout=CONFIG["PROXY_TIMEOUT"],
         )
         return response.text.splitlines() if response.status_code == 200 else []
     except Exception as e:
@@ -64,7 +88,7 @@ def test_proxy(proxy):
     """Test proxy connectivity with target URL"""
     try:
         start_time = time.time()
-        response = requests.get(
+        response = http_session.get(
             CONFIG["TEST_URL"],
             proxies={"http": proxy, "https": proxy},
             timeout=CONFIG["PROXY_TIMEOUT"],
