@@ -77,7 +77,22 @@
 </head>
 <body>
 <div class="container-fluid">
-    <h1 class="mb-4 text-center">Email Checker Dashboard 
+    <div class="card mb-4">
+        <div class="card-body">
+            <div class="row g-3 align-items-end">
+                <div class="col-md-6">
+                    <label for="config-select" class="form-label">Select configuration</label>
+                    <select id="config-select" class="form-select"></select>
+                </div>
+                <div class="col-md-6">
+                    <button id="start-button" class="btn btn-primary w-100">Start Checking</button>
+                </div>
+            </div>
+            <div class="mt-3" id="config-summary" style="font-size: 0.95rem;"></div>
+        </div>
+    </div>
+
+    <h1 class="mb-4 text-center">Email Checker Dashboard
         <span id="turbo-badge" class="badge bg-danger badge-turbo d-none">TURBO MODE</span>
     </h1>
 
@@ -221,6 +236,7 @@
 <!-- Socket.io Script -->
 <script>
 const socket = io();
+let availableConfigs = [];
 
 // Initialize Email Chart
 const emailCtx = document.getElementById('emailChart').getContext('2d');
@@ -297,12 +313,53 @@ const proxyChart = new Chart(proxyCtx, {
     }
 });
 
+function renderConfigOptions(data) {
+    availableConfigs = data.configs || [];
+    const select = document.getElementById('config-select');
+    select.innerHTML = availableConfigs.map(cfg => `<option value="${cfg.name}">${cfg.name}</option>`).join('');
+    if (data.active && data.active.name) {
+        select.value = data.active.name;
+        updateConfigSummary(data.active);
+    }
+}
+
+async function fetchConfigs() {
+    try {
+        const response = await fetch('/configs');
+        const data = await response.json();
+        renderConfigOptions(data);
+    } catch (err) {
+        document.getElementById('config-summary').innerText = 'Failed to load configurations.';
+    }
+}
+
+function updateConfigSummary(config) {
+    document.getElementById('config-summary').innerHTML = `
+        <strong>Selected:</strong> ${config.name || 'N/A'}<br>
+        <strong>Entry:</strong> ${config.entrypoint || 'N/A'}<br>
+        <strong>Data File:</strong> ${config.data_file || 'data.txt'}<br>
+        <strong>Letter:</strong> ${config.site_letter || '-'}
+    `;
+}
+
+document.getElementById('start-button').addEventListener('click', () => {
+    const select = document.getElementById('config-select');
+    const chosen = select.value;
+    socket.emit('start_processing', { config: chosen });
+});
+
+fetchConfigs();
+
 // Socket Updates
 socket.on('update', function(data) {
     const turboBadge = document.getElementById('turbo-badge');
     if (data.in_turbo_mode) turboBadge.classList.remove('d-none');
     else turboBadge.classList.add('d-none');
     document.getElementById('status-badge').innerText = data.status;
+
+    if (data.active_config) {
+        updateConfigSummary(data.active_config);
+    }
 
     // Uptime breakdown
     let totalSeconds = Math.floor(data.uptime);
@@ -397,6 +454,14 @@ socket.on('update', function(data) {
     document.getElementById('emails-day').innerText = Math.round(emailsPerSecond * 86400);
     document.getElementById('emails-week').innerText = Math.round(emailsPerSecond * 604800);
     document.getElementById('emails-month').innerText = Math.round(emailsPerSecond * 2592000);
+
+});
+
+socket.on('processing_started', function(data) {
+    if (data.config) {
+        updateConfigSummary(data.config);
+    }
+});
 
     // Finishing Time
     const remainingEmails = data.total_emails - data.processed;
