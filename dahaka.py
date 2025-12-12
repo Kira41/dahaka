@@ -5,6 +5,7 @@ import random
 import threading
 import time
 from collections import defaultdict, deque  # Added deque for turbo proxies
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 import queue
 
@@ -83,6 +84,7 @@ class Config:
         cls.PROXY_VALIDATION_URL = proxy_config.get('validation_url', cls.ENTRYPOINT_URL)
         cls.PROXY_VALIDATION_TIMEOUT = proxy_config.get('validation_timeout_seconds', 8)
         cls.PROXY_VALIDATION_WORKERS = proxy_config.get('validation_workers', max(1, min(20, cls.CONCURRENT_BROWSERS * 2)))
+        cls.PROXY_REVALIDATION_SECONDS = proxy_config.get('revalidation_seconds', 600)
         cls.CURRENT_EMAILS_TTL = config.get('ui', {}).get('current_emails_ttl', 10)
         cls.CURRENT_EMAILS_DISPLAY_LIMIT = config.get('ui', {}).get('current_emails_display_limit', 10)
         cls.STATUS_UPDATE_INTERVAL = config.get('ui', {}).get('status_update_interval', 1)
@@ -566,6 +568,22 @@ def _validate_proxy(proxy):
         return None
 
 
+def _normalize_proxy_entry(raw_proxy):
+    if not raw_proxy:
+        return None
+    proxy = raw_proxy.strip()
+    if not proxy or proxy.startswith('#'):
+        return None
+    if '://' not in proxy:
+        proxy = f"http://{proxy}"
+    parsed = urlparse(proxy)
+    if not parsed.hostname or not parsed.port:
+        logging.debug("Skipping invalid proxy entry: %s", raw_proxy)
+        return None
+    scheme = parsed.scheme or 'http'
+    return f"{scheme}://{parsed.hostname}:{parsed.port}"
+
+
 def validate_new_proxies(proxies):
     if not proxies:
         return {}
@@ -585,33 +603,64 @@ def validate_new_proxies(proxies):
 
 
 def load_proxies():
+    if not os.path.exists(Config.PROXY_FILE):
+        logging.error("[PROXY] Proxy file %s not found", Config.PROXY_FILE)
+        proxy_info.clear()
+        proxy_stats.update({'total': 0, 'active': 0, 'failed': 0, 'retrying': 0})
+        return
     with open(Config.PROXY_FILE, 'r') as f:
-        current_proxies = [line.strip() for line in f if line.strip()]
+        normalized_proxies = []
+        seen = set()
+        for line in f:
+            proxy = _normalize_proxy_entry(line)
+            if proxy and proxy not in seen:
+                seen.add(proxy)
+                normalized_proxies.append(proxy)
+
     existing_proxies = set(proxy_info.keys())
-    new_proxies = [p for p in current_proxies if p not in existing_proxies]
-    validation_results = validate_new_proxies(new_proxies)
-    for proxy in new_proxies:
+    now = time.time()
+    stale_proxies = [
+        p for p in existing_proxies
+        if p in normalized_proxies and now - proxy_info[p].get('validated_at', 0) >= Config.PROXY_REVALIDATION_SECONDS
+    ]
+    new_proxies = [p for p in normalized_proxies if p not in existing_proxies]
+
+    to_validate = new_proxies + stale_proxies
+    validation_results = validate_new_proxies(to_validate)
+    for proxy in to_validate:
         if proxy not in validation_results:
+            if proxy in proxy_info:
+                del proxy_info[proxy]
             continue
-        proxy_info[proxy] = {'state': 'available', 'retries': 0, 'latency': validation_results[proxy]}
-    proxies_to_remove = existing_proxies - set(current_proxies)
+        proxy_info[proxy] = {
+            'state': 'available',
+            'retries': 0,
+            'latency': validation_results[proxy],
+            'validated_at': now,
+        }
+
+    proxies_to_remove = existing_proxies - set(normalized_proxies)
     for proxy in proxies_to_remove:
         del proxy_info[proxy]
         if Config.TURBO_MODE:
             with turbo_lock:
                 if proxy in turbo_proxies:
                     turbo_proxies.remove(proxy)
+
     proxy_stats['total'] = len(proxy_info)
     proxy_stats['active'] = sum(1 for p in proxy_info.values() if p['state'] == 'active')
     proxy_stats['failed'] = sum(1 for p in proxy_info.values() if p['state'] == 'failed')
-    # Add active proxies to turbo mode
+
     if Config.TURBO_MODE:
         for proxy in proxy_info:
             if proxy_info[proxy]['state'] == 'active':
                 with turbo_lock:
                     if proxy not in turbo_proxies:
                         turbo_proxies.append(proxy)
-    print(f"[PROXY] Loaded {len(new_proxies)} new proxies (Total: {proxy_stats['total']}, Active: {proxy_stats['active']})")
+    print(
+        f"[PROXY] Validated {len(validation_results)} proxies; "
+        f"Total: {proxy_stats['total']}, Active: {proxy_stats['active']}"
+    )
 
 
 def drain_email_queue():
