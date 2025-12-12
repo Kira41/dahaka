@@ -203,7 +203,75 @@
                     <span>Config Settings</span>
                 </div>
                 <div class="card-body text-black" style="font-size: 0.9rem;">
-                    <div id="config-details"></div>
+                    <form id="config-form" class="row g-2">
+                        <div class="col-12">
+                            <label class="form-label">Name</label>
+                            <input type="text" class="form-control" id="config-name" required>
+                        </div>
+                        <div class="col-12">
+                            <label class="form-label">Entry URL</label>
+                            <input type="text" class="form-control" id="config-entrypoint" required>
+                        </div>
+                        <div class="col-6">
+                            <label class="form-label">Data File</label>
+                            <input type="text" class="form-control" id="config-data-file" required>
+                        </div>
+                        <div class="col-6">
+                            <label class="form-label">Proxy File</label>
+                            <input type="text" class="form-control" id="config-proxy-file" required>
+                        </div>
+                        <div class="col-6">
+                            <label class="form-label">Site Letter</label>
+                            <input type="text" class="form-control" id="config-site-letter" maxlength="1" required>
+                        </div>
+                        <div class="col-6">
+                            <label class="form-label">Concurrent Browsers</label>
+                            <input type="number" min="1" class="form-control" id="config-concurrent" required>
+                        </div>
+                        <div class="col-6">
+                            <label class="form-label">Page Load Timeout (s)</label>
+                            <input type="number" min="1" class="form-control" id="config-page-timeout" required>
+                        </div>
+                        <div class="col-6">
+                            <label class="form-label">Element Timeout (s)</label>
+                            <input type="number" min="1" class="form-control" id="config-element-timeout" required>
+                        </div>
+                        <div class="col-6">
+                            <label class="form-label">Short Element Timeout (s)</label>
+                            <input type="number" min="1" class="form-control" id="config-element-timeout-short" required>
+                        </div>
+                        <div class="col-6">
+                            <label class="form-label">Proxy Max Retries</label>
+                            <input type="number" min="0" class="form-control" id="config-proxy-retries" required>
+                        </div>
+                        <div class="col-6">
+                            <label class="form-label">Current Emails TTL (s)</label>
+                            <input type="number" min="1" class="form-control" id="config-current-ttl" required>
+                        </div>
+                        <div class="col-6">
+                            <label class="form-label">Emails Display Limit</label>
+                            <input type="number" min="1" class="form-control" id="config-display-limit" required>
+                        </div>
+                        <div class="col-6">
+                            <label class="form-label">Status Update Interval (s)</label>
+                            <input type="number" min="1" class="form-control" id="config-status-interval" required>
+                        </div>
+                        <div class="col-6 d-flex align-items-center">
+                            <div class="form-check">
+                                <input class="form-check-input" type="checkbox" id="config-headless">
+                                <label class="form-check-label" for="config-headless">Headless Mode</label>
+                            </div>
+                        </div>
+                        <div class="col-6 d-flex align-items-center">
+                            <div class="form-check">
+                                <input class="form-check-input" type="checkbox" id="config-turbo">
+                                <label class="form-check-label" for="config-turbo">Turbo Mode</label>
+                            </div>
+                        </div>
+                        <div class="col-12">
+                            <button type="submit" class="btn btn-sm btn-primary w-100">Save Config</button>
+                        </div>
+                    </form>
                 </div>
             </div>
         </div>
@@ -234,6 +302,14 @@
             </div>
         </div>
     </div>
+    <div class="row">
+        <div class="col-12">
+            <div class="card mb-4">
+                <div class="card-header bg-danger text-white">Errors</div>
+                <div class="card-body" id="error-messages" style="max-height: 200px; overflow-y: auto;"></div>
+            </div>
+        </div>
+    </div>
 </div>
 
 <!-- Socket.io Script -->
@@ -241,6 +317,8 @@
 const socket = io();
 let availableConfigs = [];
 let isRunning = false;
+let latestConfig = null;
+let configFormInitialized = false;
 
 // Initialize Email Chart
 const emailCtx = document.getElementById('emailChart').getContext('2d');
@@ -346,6 +424,60 @@ function updateConfigSummary(config) {
     `;
 }
 
+function populateConfigForm(config) {
+    if (!config) return;
+    const activeElement = document.activeElement;
+    if (configFormInitialized && activeElement && activeElement.closest('#config-form')) {
+        return;
+    }
+    latestConfig = config;
+    document.getElementById('config-name').value = config.CONFIG_NAME || '';
+    document.getElementById('config-entrypoint').value = config.ENTRYPOINT_URL || '';
+    document.getElementById('config-data-file').value = config.DATA_FILE || '';
+    document.getElementById('config-proxy-file').value = config.PROXY_FILE || '';
+    document.getElementById('config-site-letter').value = config.SITE_LETTER || '';
+    document.getElementById('config-concurrent').value = config.CONCURRENT_BROWSERS || 1;
+    document.getElementById('config-page-timeout').value = config.PAGE_LOAD_TIMEOUT || 0;
+    document.getElementById('config-element-timeout').value = config.ELEMENT_TIMEOUT || 0;
+    document.getElementById('config-element-timeout-short').value = config.ELEMENT_TIMEOUT_SHORT || 0;
+    document.getElementById('config-proxy-retries').value = config.PROXY_MAX_RETRIES || 0;
+    document.getElementById('config-headless').checked = !!config.HEADLESS_MODE;
+    document.getElementById('config-current-ttl').value = config.CURRENT_EMAILS_TTL || 0;
+    document.getElementById('config-display-limit').value = config.CURRENT_EMAILS_DISPLAY_LIMIT || 0;
+    document.getElementById('config-status-interval').value = config.STATUS_UPDATE_INTERVAL || 0;
+    document.getElementById('config-turbo').checked = !!config.TURBO_MODE;
+    configFormInitialized = true;
+}
+
+function gatherConfigFormData() {
+    return {
+        name: document.getElementById('config-name').value,
+        entrypoint: document.getElementById('config-entrypoint').value,
+        data_file: document.getElementById('config-data-file').value,
+        proxy_file: document.getElementById('config-proxy-file').value,
+        site_letter: document.getElementById('config-site-letter').value,
+        concurrent_browsers: parseInt(document.getElementById('config-concurrent').value, 10),
+        page_load_timeout: parseInt(document.getElementById('config-page-timeout').value, 10),
+        element_timeout: parseInt(document.getElementById('config-element-timeout').value, 10),
+        element_timeout_short: parseInt(document.getElementById('config-element-timeout-short').value, 10),
+        proxy_max_retries: parseInt(document.getElementById('config-proxy-retries').value, 10),
+        headless: document.getElementById('config-headless').checked,
+        current_emails_ttl: parseInt(document.getElementById('config-current-ttl').value, 10),
+        current_emails_display_limit: parseInt(document.getElementById('config-display-limit').value, 10),
+        status_update_interval: parseInt(document.getElementById('config-status-interval').value, 10),
+        turbo_mode: document.getElementById('config-turbo').checked,
+    };
+}
+
+function showError(message) {
+    const errorContainer = document.getElementById('error-messages');
+    const timestamp = new Date().toLocaleTimeString();
+    const alert = document.createElement('div');
+    alert.className = 'alert alert-danger py-2';
+    alert.innerHTML = `<strong>[${timestamp}]</strong> ${message}`;
+    errorContainer.prepend(alert);
+}
+
 document.getElementById('start-button').addEventListener('click', () => {
     const select = document.getElementById('config-select');
     const chosen = select.value;
@@ -354,6 +486,28 @@ document.getElementById('start-button').addEventListener('click', () => {
 
 document.getElementById('stop-button').addEventListener('click', () => {
     socket.emit('stop_processing');
+});
+
+document.getElementById('config-form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const payload = gatherConfigFormData();
+    try {
+        const response = await fetch('/update_config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        const data = await response.json();
+        if (!response.ok || data.error) {
+            showError(data.error || 'Failed to update configuration.');
+            return;
+        }
+        if (data.active_config) {
+            updateConfigSummary(data.active_config);
+        }
+    } catch (err) {
+        showError('Unable to update configuration.');
+    }
 });
 
 function updateControlButtons(running) {
@@ -377,6 +531,10 @@ socket.on('update', function(data) {
 
     if (data.active_config) {
         updateConfigSummary(data.active_config);
+    }
+
+    if (data.config) {
+        populateConfigForm(data.config);
     }
 
     // Uptime breakdown
@@ -449,12 +607,6 @@ socket.on('update', function(data) {
         return `<div class="proxy-item ${statusClass}"><strong>${proxy.proxy}</strong> - ${proxy.status.toUpperCase()}<span class="badge bg-light text-dark float-end">${proxy.retries || 0} retries</span></div>`;
     }).join('');
 
-    // Config
-    const configDetailsDiv = document.getElementById('config-details');
-    configDetailsDiv.innerHTML = Object.entries(data.config || {})
-        .map(([key, value]) => `<div><strong>${key}</strong>: <code>${value}</code></div>`)
-        .join('');
-
     // Current Emails
     const currentEmailsDiv = document.getElementById('current-emails');
     currentEmailsDiv.innerHTML = data.current_emails.map(email => {
@@ -501,7 +653,15 @@ socket.on('processing_stopped', function(data) {
     isRunning = false;
     updateControlButtons(false);
 });
- 
+
+socket.on('error', function(data) {
+    if (data && data.message) {
+        showError(data.message);
+    } else {
+        showError('An unknown error occurred.');
+    }
+});
+
 </script>
 </body>
 </html>

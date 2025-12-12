@@ -8,7 +8,7 @@ from collections import defaultdict, deque  # Added deque for turbo proxies
 from urllib.parse import urlparse
 import queue
 
-from flask import Flask, jsonify, render_template
+from flask import Flask, jsonify, render_template, request
 from flask_socketio import SocketIO
 from selenium import webdriver
 from selenium.common.exceptions import TimeoutException, WebDriverException
@@ -46,6 +46,22 @@ automation_config = load_automation_config(CONFIG_PATH)
 
 app = Flask(__name__)
 socketio = SocketIO(app)
+
+
+class SocketIOErrorHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            if record.levelno >= logging.ERROR:
+                socketio.emit('error', {'message': self.format(record)})
+        except Exception:
+            # Avoid infinite loops if emitting fails
+            pass
+
+
+error_handler = SocketIOErrorHandler()
+error_handler.setLevel(logging.ERROR)
+error_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+logging.getLogger().addHandler(error_handler)
 
 
 class Config:
@@ -388,7 +404,7 @@ def update_status():
                 'ENTRYPOINT_URL': Config.ENTRYPOINT_URL,
                 'PROXY_FILE': Config.PROXY_FILE,
                 'DATA_FILE': Config.DATA_FILE,
-                'HEADLESS_MODE': 'Enabled' if Config.HEADLESS_MODE else 'Disabled',
+                'HEADLESS_MODE': bool(Config.HEADLESS_MODE),
                 'PAGE_LOAD_TIMEOUT': Config.PAGE_LOAD_TIMEOUT,
                 'ELEMENT_TIMEOUT_SHORT': Config.ELEMENT_TIMEOUT_SHORT,
                 'ELEMENT_TIMEOUT': Config.ELEMENT_TIMEOUT,
@@ -397,7 +413,7 @@ def update_status():
                 'CURRENT_EMAILS_DISPLAY_LIMIT': Config.CURRENT_EMAILS_DISPLAY_LIMIT,
                 'STATUS_UPDATE_INTERVAL': Config.STATUS_UPDATE_INTERVAL,
                 'SITE_LETTER': Config.SITE_LETTER,
-                'TURBO_MODE': 'Enabled' if Config.TURBO_MODE else 'Disabled'
+                'TURBO_MODE': bool(Config.TURBO_MODE)
             }
 
             if processing_thread and processing_thread.is_alive():
@@ -709,6 +725,62 @@ def index():
 @app.route('/configs')
 def list_configs():
     return jsonify({'configs': available_configs, 'active': active_config})
+
+
+@app.route('/update_config', methods=['POST'])
+def update_config():
+    global automation_config, active_config
+    if processing_thread and processing_thread.is_alive():
+        return jsonify({'error': 'Cannot update configuration while processing is running.'}), 400
+
+    payload = request.get_json() or {}
+
+    automation_config = dict(automation_config)
+    automation_config['name'] = payload.get('name', automation_config.get('name', 'automation'))
+    automation_config['entrypoint'] = payload.get('entrypoint', automation_config.get('entrypoint', ''))
+    automation_config['site_letter'] = payload.get('site_letter', automation_config.get('site_letter', 'A'))
+
+    files_section = automation_config.get('files', {}).copy()
+    files_section['proxy_file'] = payload.get('proxy_file', files_section.get('proxy_file', Config.PROXY_FILE))
+    files_section['data_file'] = payload.get('data_file', files_section.get('data_file', Config.DATA_FILE))
+    automation_config['files'] = files_section
+
+    concurrency_section = automation_config.get('concurrency', {}).copy()
+    concurrency_section['workers'] = payload.get('concurrent_browsers', concurrency_section.get('workers', Config.CONCURRENT_BROWSERS))
+    automation_config['concurrency'] = concurrency_section
+
+    browser_section = automation_config.get('browser', {}).copy()
+    browser_section['headless'] = int(bool(payload.get('headless', browser_section.get('headless', Config.HEADLESS_MODE))))
+    browser_section['page_load_timeout_seconds'] = payload.get('page_load_timeout', browser_section.get('page_load_timeout_seconds', Config.PAGE_LOAD_TIMEOUT))
+    automation_config['browser'] = browser_section
+
+    timeouts_section = automation_config.get('timeouts', {}).copy()
+    timeouts_section['element_timeout_short_seconds'] = payload.get('element_timeout_short', timeouts_section.get('element_timeout_short_seconds', Config.ELEMENT_TIMEOUT_SHORT))
+    timeouts_section['element_timeout_seconds'] = payload.get('element_timeout', timeouts_section.get('element_timeout_seconds', Config.ELEMENT_TIMEOUT))
+    automation_config['timeouts'] = timeouts_section
+
+    proxy_section = automation_config.get('proxy', {}).copy()
+    proxy_section['max_retries'] = payload.get('proxy_max_retries', proxy_section.get('max_retries', Config.PROXY_MAX_RETRIES))
+    automation_config['proxy'] = proxy_section
+
+    ui_section = automation_config.get('ui', {}).copy()
+    ui_section['current_emails_ttl'] = payload.get('current_emails_ttl', ui_section.get('current_emails_ttl', Config.CURRENT_EMAILS_TTL))
+    ui_section['current_emails_display_limit'] = payload.get('current_emails_display_limit', ui_section.get('current_emails_display_limit', Config.CURRENT_EMAILS_DISPLAY_LIMIT))
+    ui_section['status_update_interval'] = payload.get('status_update_interval', ui_section.get('status_update_interval', Config.STATUS_UPDATE_INTERVAL))
+    automation_config['ui'] = ui_section
+
+    automation_config['turbo_mode'] = bool(payload.get('turbo_mode', automation_config.get('turbo_mode', Config.TURBO_MODE)))
+
+    Config.load_from_config(automation_config)
+    set_active_config({
+        'name': automation_config.get('name', Config.CONFIG_NAME),
+        'path': active_config['path'] if active_config else CONFIG_PATH,
+        'site_letter': Config.SITE_LETTER,
+        'data_file': Config.DATA_FILE,
+        'entrypoint': Config.ENTRYPOINT_URL
+    })
+
+    return jsonify({'success': True, 'config': automation_config, 'active_config': active_config})
 
 
 def process_emails():
