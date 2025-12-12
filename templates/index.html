@@ -84,8 +84,11 @@
                     <label for="config-select" class="form-label">Select configuration</label>
                     <select id="config-select" class="form-select"></select>
                 </div>
-                <div class="col-md-6">
+                <div class="col-md-3">
                     <button id="start-button" class="btn btn-primary w-100">Start Checking</button>
+                </div>
+                <div class="col-md-3">
+                    <button id="stop-button" class="btn btn-outline-danger w-100" disabled>Stop Checking</button>
                 </div>
             </div>
             <div class="mt-3" id="config-summary" style="font-size: 0.95rem;"></div>
@@ -237,6 +240,7 @@
 <script>
 const socket = io();
 let availableConfigs = [];
+let isRunning = false;
 
 // Initialize Email Chart
 const emailCtx = document.getElementById('emailChart').getContext('2d');
@@ -348,6 +352,18 @@ document.getElementById('start-button').addEventListener('click', () => {
     socket.emit('start_processing', { config: chosen });
 });
 
+document.getElementById('stop-button').addEventListener('click', () => {
+    socket.emit('stop_processing');
+});
+
+function updateControlButtons(running) {
+    const startBtn = document.getElementById('start-button');
+    const stopBtn = document.getElementById('stop-button');
+    startBtn.disabled = running;
+    stopBtn.disabled = !running;
+    startBtn.innerText = running ? 'Running...' : 'Start Checking';
+}
+
 fetchConfigs();
 
 // Socket Updates
@@ -356,6 +372,8 @@ socket.on('update', function(data) {
     if (data.in_turbo_mode) turboBadge.classList.remove('d-none');
     else turboBadge.classList.add('d-none');
     document.getElementById('status-badge').innerText = data.status;
+    isRunning = data.status === 'running';
+    updateControlButtons(isRunning);
 
     if (data.active_config) {
         updateConfigSummary(data.active_config);
@@ -455,14 +473,6 @@ socket.on('update', function(data) {
     document.getElementById('emails-week').innerText = Math.round(emailsPerSecond * 604800);
     document.getElementById('emails-month').innerText = Math.round(emailsPerSecond * 2592000);
 
-});
-
-socket.on('processing_started', function(data) {
-    if (data.config) {
-        updateConfigSummary(data.config);
-    }
-});
-
     // Finishing Time
     const remainingEmails = data.total_emails - data.processed;
     let finishingTime = 'N/A';
@@ -473,7 +483,25 @@ socket.on('processing_started', function(data) {
         finishingTime = `${hours}h ${minutes}m`;
     }
     document.getElementById('finishing-time').innerText = finishingTime;
+
 });
+
+socket.on('processing_started', function(data) {
+    if (data.config) {
+        updateConfigSummary(data.config);
+    }
+    isRunning = true;
+    updateControlButtons(true);
+});
+
+socket.on('processing_stopped', function(data) {
+    if (data && data.config) {
+        updateConfigSummary(data.config);
+    }
+    isRunning = false;
+    updateControlButtons(false);
+});
+ 
 </script>
 </body>
 </html>
