@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import random
 import threading
@@ -37,6 +38,10 @@ def load_automation_config(path: str):
         return json.load(f)
 
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
 automation_config = load_automation_config(CONFIG_PATH)
 
 app = Flask(__name__)
@@ -492,6 +497,7 @@ def test_site(proxy, email):
                     turbo_proxies.remove(proxy)
         raise
     except Exception as e:
+        logging.exception("Unexpected error while testing proxy %s for email %s", proxy, email)
         with lock:
             if proxy in proxy_info:
                 proxy_info[proxy]['retries'] += 1
@@ -683,11 +689,12 @@ def worker():
             with lock:
                 processed_emails.add(email_part)
         except ProxyError:
+            logging.exception("Proxy error while processing %s", email_part)
             with lock:
                 if email_part not in processed_emails:
                     email_queue.put(line)
         except Exception as e:
-            print(f"[ERROR] {str(e)}")
+            logging.exception("Unhandled error while processing %s", email_part)
             with lock:
                 if email_part not in processed_emails:
                     email_queue.put(line)
@@ -747,6 +754,7 @@ def process_emails():
         for t in threads:
             t.join()
     except Exception as e:
+        logging.exception("Error in process_emails")
         socketio.emit('error', {'message': str(e)})
     finally:
         stop_event.set()
