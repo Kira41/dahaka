@@ -7,7 +7,7 @@ from collections import defaultdict, deque  # Added deque for turbo proxies
 from urllib.parse import urlparse
 import queue
 
-from flask import Flask, render_template
+from flask import Flask, jsonify, render_template
 from flask_socketio import SocketIO
 from selenium import webdriver
 from selenium.common.exceptions import TimeoutException, WebDriverException
@@ -16,7 +16,20 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-CONFIG_PATH = os.environ.get('AUTOMATION_CONFIG', 'configs/amazon.json')
+
+def find_default_config_path():
+    env_path = os.environ.get('AUTOMATION_CONFIG')
+    if env_path:
+        return env_path
+    config_dir = 'configs'
+    if os.path.isdir(config_dir):
+        for filename in os.listdir(config_dir):
+            if filename.endswith('.json'):
+                return os.path.join(config_dir, filename)
+    raise FileNotFoundError('No configuration files found. Place a JSON file inside the configs directory.')
+
+
+CONFIG_PATH = find_default_config_path()
 
 
 def load_automation_config(path: str):
@@ -31,21 +44,26 @@ socketio = SocketIO(app)
 
 
 class Config:
-    CONFIG_NAME = automation_config.get('name', 'automation')
-    CONCURRENT_BROWSERS = automation_config.get('concurrency', {}).get('workers', 10)
-    AMAZON_URL = automation_config.get('entrypoint', 'https://brandregistry.amazon.com/')
-    PROXY_FILE = automation_config.get('files', {}).get('proxy_file', 'google_valid_proxies.txt')
-    DATA_FILE = automation_config.get('files', {}).get('data_file', 'data.txt')
-    HEADLESS_MODE = bool(automation_config.get('browser', {}).get('headless', 0))
-    PAGE_LOAD_TIMEOUT = automation_config.get('browser', {}).get('page_load_timeout_seconds', 10)
-    ELEMENT_TIMEOUT_SHORT = automation_config.get('timeouts', {}).get('element_timeout_short_seconds', 3)
-    ELEMENT_TIMEOUT = automation_config.get('timeouts', {}).get('element_timeout_seconds', 5)
-    PROXY_MAX_RETRIES = automation_config.get('proxy', {}).get('max_retries', 0)
-    CURRENT_EMAILS_TTL = automation_config.get('ui', {}).get('current_emails_ttl', 10)
-    CURRENT_EMAILS_DISPLAY_LIMIT = automation_config.get('ui', {}).get('current_emails_display_limit', 10)
-    STATUS_UPDATE_INTERVAL = automation_config.get('ui', {}).get('status_update_interval', 1)
-    SITE_LETTER = automation_config.get('site_letter', 'A')
-    TURBO_MODE = automation_config.get('turbo_mode', True)  # Enable turbo mode globally
+    @classmethod
+    def load_from_config(cls, config):
+        cls.CONFIG_NAME = config.get('name', 'automation')
+        cls.CONCURRENT_BROWSERS = config.get('concurrency', {}).get('workers', 10)
+        cls.ENTRYPOINT_URL = config.get('entrypoint', 'https://example.com/')
+        cls.PROXY_FILE = config.get('files', {}).get('proxy_file', 'google_valid_proxies.txt')
+        cls.DATA_FILE = config.get('files', {}).get('data_file', 'data.txt')
+        cls.HEADLESS_MODE = bool(config.get('browser', {}).get('headless', 0))
+        cls.PAGE_LOAD_TIMEOUT = config.get('browser', {}).get('page_load_timeout_seconds', 10)
+        cls.ELEMENT_TIMEOUT_SHORT = config.get('timeouts', {}).get('element_timeout_short_seconds', 3)
+        cls.ELEMENT_TIMEOUT = config.get('timeouts', {}).get('element_timeout_seconds', 5)
+        cls.PROXY_MAX_RETRIES = config.get('proxy', {}).get('max_retries', 0)
+        cls.CURRENT_EMAILS_TTL = config.get('ui', {}).get('current_emails_ttl', 10)
+        cls.CURRENT_EMAILS_DISPLAY_LIMIT = config.get('ui', {}).get('current_emails_display_limit', 10)
+        cls.STATUS_UPDATE_INTERVAL = config.get('ui', {}).get('status_update_interval', 1)
+        cls.SITE_LETTER = config.get('site_letter', 'A')
+        cls.TURBO_MODE = config.get('turbo_mode', True)  # Enable turbo mode globally
+
+
+Config.load_from_config(automation_config)
 
 # Thread-safe variables
 email_queue = queue.Queue()
@@ -63,6 +81,90 @@ total_emails = 0
 # Turbo mode variables
 turbo_proxies = deque()  # Prioritized proxies
 turbo_lock = threading.Lock()  # Lock for thread-safe access
+
+
+available_configs = []
+active_config = None
+processing_thread = None
+processing_lock = threading.Lock()
+
+
+def reset_runtime_state():
+    global email_queue, processed_emails, success_count, failure_count, start_time
+    global current_emails, proxy_stats, attempted_proxies, proxy_info, total_emails
+    email_queue = queue.Queue()
+    processed_emails = set()
+    success_count = 0
+    failure_count = 0
+    start_time = time.time()
+    current_emails = []
+    proxy_stats = {'total': 0, 'active': 0, 'failed': 0, 'retrying': 0}
+    attempted_proxies = defaultdict(set)
+    proxy_info = {}
+    total_emails = 0
+    with turbo_lock:
+        turbo_proxies.clear()
+
+
+def load_available_configs():
+    configs = []
+    config_dir = 'configs'
+    if not os.path.isdir(config_dir):
+        return configs
+    for filename in sorted(os.listdir(config_dir)):
+        if filename.endswith('.json'):
+            path = os.path.join(config_dir, filename)
+            try:
+                config_data = load_automation_config(path)
+                configs.append({
+                    'name': config_data.get('name', os.path.splitext(filename)[0]),
+                    'path': path,
+                    'site_letter': config_data.get('site_letter', 'A'),
+                    'data_file': config_data.get('files', {}).get('data_file', 'data.txt'),
+                    'entrypoint': config_data.get('entrypoint', '')
+                })
+            except Exception as exc:
+                print(f"[CONFIG] Failed to load {path}: {exc}")
+    return configs
+
+
+def set_active_config(config_meta):
+    global automation_config, active_config
+    automation_config = load_automation_config(config_meta['path'])
+    Config.load_from_config(automation_config)
+    active_config = {
+        'name': automation_config.get('name', config_meta.get('name')),
+        'path': config_meta['path'],
+        'site_letter': Config.SITE_LETTER,
+        'data_file': Config.DATA_FILE,
+        'entrypoint': Config.ENTRYPOINT_URL
+    }
+    for idx, cfg in enumerate(available_configs):
+        if cfg['path'] == config_meta['path']:
+            available_configs[idx] = active_config
+            break
+
+
+def initialize_configs():
+    global available_configs, active_config
+    available_configs = load_available_configs()
+    matching = [c for c in available_configs if c['path'] == CONFIG_PATH]
+    if matching:
+        set_active_config(matching[0])
+    elif available_configs:
+        set_active_config(available_configs[0])
+    else:
+        active_config = {
+            'name': Config.CONFIG_NAME,
+            'path': CONFIG_PATH,
+            'site_letter': Config.SITE_LETTER,
+            'data_file': Config.DATA_FILE,
+            'entrypoint': Config.ENTRYPOINT_URL
+        }
+        available_configs.append(active_config)
+
+
+initialize_configs()
 
 
 def selector_to_locator(selector):
@@ -138,7 +240,7 @@ def determine_presence(driver, logic, fallback_result='unknown'):
 
 
 def normalize_target(target):
-    return (target or Config.AMAZON_URL).replace('{{ entrypoint }}', Config.AMAZON_URL)
+    return (target or Config.ENTRYPOINT_URL).replace('{{ entrypoint }}', Config.ENTRYPOINT_URL)
 
 
 def mark_proxy_active(proxy):
@@ -161,7 +263,7 @@ def mark_proxy_active(proxy):
 def action_navigate(driver, step, context):
     target = normalize_target(step.get('target'))
     driver.get(target)
-    expected_host = urlparse(Config.AMAZON_URL).netloc
+    expected_host = urlparse(Config.ENTRYPOINT_URL).netloc
     if expected_host and expected_host not in urlparse(driver.current_url).netloc:
         raise ProxyError(f"Proxy {context.get('proxy')} redirected to invalid domain", first_attempt=True)
 
@@ -274,8 +376,9 @@ def update_status():
             
             # Prepare Config values to send
             config_data = {
+                'CONFIG_NAME': Config.CONFIG_NAME,
                 'CONCURRENT_BROWSERS': Config.CONCURRENT_BROWSERS,
-                'AMAZON_URL': Config.AMAZON_URL,
+                'ENTRYPOINT_URL': Config.ENTRYPOINT_URL,
                 'PROXY_FILE': Config.PROXY_FILE,
                 'DATA_FILE': Config.DATA_FILE,
                 'HEADLESS_MODE': 'Enabled' if Config.HEADLESS_MODE else 'Disabled',
@@ -291,7 +394,7 @@ def update_status():
             }
 
             status_data = {
-                'status': 'running',
+                'status': 'running' if processing_thread and processing_thread.is_alive() else 'idle',
                 'total_emails': total_emails,
                 'processed': len(processed_emails),
                 'success': success_count,
@@ -306,12 +409,13 @@ def update_status():
                 'current_emails': current_emails[:Config.CURRENT_EMAILS_DISPLAY_LIMIT],
                 'uptime': round(elapsed, 2),
                 'in_turbo_mode': in_turbo_mode,
-                'config': config_data
+                'config': config_data,
+                'active_config': active_config
             }
         socketio.emit('update', status_data)
         socketio.sleep(Config.STATUS_UPDATE_INTERVAL)
 
-def test_amazon(proxy, email):
+def test_site(proxy, email):
     global success_count, failure_count
     chrome_options = Options()
     chrome_options.add_argument(f'--proxy-server={proxy}')
@@ -510,7 +614,7 @@ def worker():
                     'status': status,
                     'timestamp': time.time()
                 })
-            found = test_amazon(proxy, email_part)
+            found = test_site(proxy, email_part)
             site_letter = Config.SITE_LETTER
             if site_letter in tag_dict:
                 tag_dict[site_letter]['value'] = '1' if found else '0'
@@ -562,8 +666,14 @@ def worker():
 def index():
     return render_template('index.html')
 
-def background_thread():
-    global total_emails
+
+@app.route('/configs')
+def list_configs():
+    return jsonify({'configs': available_configs, 'active': active_config})
+
+
+def process_emails():
+    global total_emails, processing_thread
     try:
         with open(Config.DATA_FILE, 'r') as f:
             all_lines = [line.rstrip('\n') for line in f if line.strip()]
@@ -600,8 +710,29 @@ def background_thread():
             t.join()
     except Exception as e:
         socketio.emit('error', {'message': str(e)})
+    finally:
+        with processing_lock:
+            processing_thread = None
+
+@socketio.on('start_processing')
+def start_processing(message):
+    requested_name = message.get('config') if isinstance(message, dict) else None
+    selected = next((c for c in available_configs if c['name'] == requested_name), None)
+    if not selected:
+        socketio.emit('error', {'message': f"Configuration '{requested_name}' not found."})
+        return
+    with processing_lock:
+        global processing_thread
+        if processing_thread and processing_thread.is_alive():
+            socketio.emit('error', {'message': 'Processing is already running.'})
+            return
+        set_active_config(selected)
+        reset_runtime_state()
+        processing_thread = threading.Thread(target=process_emails, daemon=True)
+        processing_thread.start()
+    socketio.emit('processing_started', {'config': active_config})
+
 
 if __name__ == '__main__':
-    threading.Thread(target=background_thread).start()
-    threading.Thread(target=update_status).start()
+    threading.Thread(target=update_status, daemon=True).start()
     socketio.run(app, debug=False)
