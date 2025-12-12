@@ -1,4 +1,5 @@
 import logging
+import random
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -18,8 +19,10 @@ requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 CONFIG = {
     # Proxy sources
     "API_URL": "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=all",
-    # Use an HTTP endpoint to avoid HTTPS CONNECT failures with HTTP-only proxies
-    "TEST_URL": "http://example.com",
+    # Use Google lightweight endpoint for realistic traffic shape and detection
+    "TEST_URL": "https://www.google.com/generate_204",
+    # Secondary free API to verify that the proxy truly connects to the internet
+    "VERIFICATION_URL": "https://ipwho.is/",
     
     # Proxy parameters
     "PROXY_TIMEOUT": 10,          # Seconds for proxy to respond
@@ -27,6 +30,14 @@ CONFIG = {
     "MAX_WORKERS": 100,           # Maximum parallel threads
     "REQUEST_RETRIES": 3,         # Number of retries for HTTP requests
     "REQUEST_BACKOFF": 1,         # Backoff factor between retries
+    "USER_AGENTS": (
+        # A small pool of modern desktop user agents to mimic real traffic
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_4_1) AppleWebKit/605.1.15 "
+        "(KHTML, like Gecko) Version/16.5 Safari/605.1.15",
+        "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0",
+    ),
 
     # Application settings
     "OUTPUT_FILE": "google_valid_proxies.txt",
@@ -87,20 +98,49 @@ def get_proxies_from_api():
         logging.error(f"Error fetching proxies: {e}")
         return []
 
+def build_headers():
+    """Generate headers that mimic a real browser visit to Google."""
+    return {
+        "User-Agent": random.choice(CONFIG["USER_AGENTS"]),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif," "image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+    }
+
+
+def verify_proxy_reachability(proxy):
+    """Second-chance verification using a free IP lookup API."""
+    try:
+        response = http_session.get(
+            CONFIG["VERIFICATION_URL"],
+            proxies={"http": proxy, "https": proxy},
+            timeout=CONFIG["PROXY_TIMEOUT"],
+            verify=CONFIG["VERIFY_SSL"],
+            headers={"User-Agent": random.choice(CONFIG["USER_AGENTS"])}
+        )
+        # ipwho.is returns a JSON payload with a boolean success field
+        return response.status_code == 200 and response.json().get("success", False)
+    except Exception:
+        return False
+
+
 def test_proxy(proxy):
-    """Test proxy connectivity with target URL"""
+    """Test proxy connectivity with Google and re-verify with a free API."""
     try:
         start_time = time.time()
         response = http_session.get(
             CONFIG["TEST_URL"],
             proxies={"http": proxy, "https": proxy},
             timeout=CONFIG["PROXY_TIMEOUT"],
-            verify=CONFIG["VERIFY_SSL"]
+            verify=CONFIG["VERIFY_SSL"],
+            headers=build_headers(),
+            allow_redirects=False,
         )
         latency = time.time() - start_time
-        
-        if response.status_code == 200 and latency <= CONFIG["LATENCY_THRESHOLD"]:
-            return (proxy.strip(), latency)
+
+        if response.status_code in (204, 200) and latency <= CONFIG["LATENCY_THRESHOLD"]:
+            if verify_proxy_reachability(proxy):
+                return (proxy.strip(), latency)
     except Exception as e:
         logging.debug(f"Proxy {proxy} failed: {str(e)}")
     return None
