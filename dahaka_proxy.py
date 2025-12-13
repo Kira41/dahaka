@@ -133,11 +133,32 @@ def verify_proxy_reachability(proxy):
         return False
 
 
+def format_failure_reason(proxy_result):
+    """Create a short, human-readable reason string for a failed proxy test."""
+    if not proxy_result:
+        return "unknown failure"
+
+    reason = proxy_result.get("reason")
+    status_code = proxy_result.get("status_code")
+    latency = proxy_result.get("latency")
+
+    parts = []
+    if reason:
+        parts.append(reason)
+    if status_code:
+        parts.append(f"status={status_code}")
+    if latency is not None:
+        parts.append(f"latency={latency:.2f}s")
+
+    return " | ".join(parts) if parts else "unknown failure"
+
+
 def test_proxy(proxy):
     """Test proxy connectivity with Google and re-verify with a free API."""
     logging.debug("Testing proxy %s", proxy)
+    start_time = time.time()
+
     try:
-        start_time = time.time()
         response = http_session.get(
             CONFIG["TEST_URL"],
             proxies={"http": proxy, "https": proxy},
@@ -147,21 +168,35 @@ def test_proxy(proxy):
             allow_redirects=False,
         )
         latency = time.time() - start_time
+    except Exception as exc:
+        return {
+            "proxy": proxy.strip(),
+            "status": "error",
+            "reason": str(exc),
+        }
 
-        if response.status_code in (204, 200) and latency <= CONFIG["LATENCY_THRESHOLD"]:
-            if verify_proxy_reachability(proxy):
-                return (proxy.strip(), latency)
-            logging.debug("Proxy %s failed reachability check", proxy)
-        else:
-            logging.debug(
-                "Proxy %s returned status %s or latency %.2fs exceeded threshold",
-                proxy,
-                response.status_code,
-                latency,
-            )
-    except Exception as e:
-        logging.debug(f"Proxy {proxy} failed: {str(e)}")
-    return None
+    if response.status_code in (204, 200) and latency <= CONFIG["LATENCY_THRESHOLD"]:
+        if verify_proxy_reachability(proxy):
+            return {
+                "proxy": proxy.strip(),
+                "latency": latency,
+                "status": "valid",
+            }
+
+        return {
+            "proxy": proxy.strip(),
+            "status": "unreachable",
+            "latency": latency,
+            "reason": "failed reachability check",
+        }
+
+    return {
+        "proxy": proxy.strip(),
+        "status": "invalid",
+        "status_code": response.status_code,
+        "latency": latency,
+        "reason": "bad status or slow response",
+    }
 
 def save_proxies(new_proxies):
     """Save valid proxies to file with deduplication"""
@@ -233,8 +268,10 @@ def main():
             for future in as_completed(future_to_proxy):
                 tested_count += 1
                 result = future.result()
-                if result:
-                    proxy, latency = result
+
+                if result and result.get("status") == "valid":
+                    proxy = result["proxy"]
+                    latency = result.get("latency", 0)
                     if save_proxy_realtime(proxy, saved_proxies, save_lock):
                         new_valid_count += 1
                     logging.info(
@@ -242,8 +279,11 @@ def main():
                         f"({CONFIG['COLORS']['SUCCESS']}{latency:.2f}s{CONFIG['COLORS']['RESET']})"
                     )
                 else:
+                    reason = format_failure_reason(result)
                     logging.debug(
-                        "Proxy %s is invalid or failed checks", future_to_proxy[future]
+                        "Proxy %s is invalid or failed checks: %s",
+                        future_to_proxy[future],
+                        reason,
                     )
 
         logging.info(
