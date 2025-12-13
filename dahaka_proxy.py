@@ -20,14 +20,16 @@ requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 CONFIG = {
     # Proxy sources
     "API_URL": "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=all",
-    # Use Google lightweight endpoint for realistic traffic shape and detection
-    "TEST_URL": "https://www.google.com/generate_204",
-    # Some free proxies cannot establish HTTPS tunnels; use a lightweight HTTP
-    # endpoint as a fallback to avoid false negatives.
-    "FALLBACK_TEST_URL": "http://httpbin.org/status/204",
+    # Primary and fallback targets. The second target is intentionally configured
+    # to allow unlimited retries so transient HTTP errors or noisy networks do
+    # not immediately disqualify a working proxy.
+    "FLEXIBLE_TEST_TARGETS": (
+        {"url": "https://www.google.com/generate_204", "retries": 3},
+        {"url": "http://httpbin.org/status/204", "retries": None},
+    ),
     # Secondary free API to verify that the proxy truly connects to the internet
     "VERIFICATION_URL": "https://ipwho.is/",
-    
+
     # Proxy parameters
     "PROXY_TIMEOUT": 10,          # Seconds for proxy to respond
     "LATENCY_THRESHOLD": 7,       # Maximum acceptable latency in seconds
@@ -47,14 +49,14 @@ CONFIG = {
     "OUTPUT_FILE": "google_valid_proxies.txt",
     "RETRY_INTERVAL": 5,         # Seconds between checks
     "VERIFY_SSL": False,          # SSL verification toggle
-    
+
     # Color configurations
     "COLORS": {
         "BRIGHT": colorama.Style.BRIGHT,
         "SUCCESS": colorama.Fore.GREEN,
         "RESET": colorama.Style.RESET_ALL,
     },
-    
+
     # Logging configuration
     "LOGGING": {
         "LEVEL": logging.DEBUG,
@@ -63,9 +65,9 @@ CONFIG = {
 }
 
 
-def build_session():
+def build_session(max_retries):
     retry_strategy = Retry(
-        total=CONFIG["REQUEST_RETRIES"],
+        total=max_retries,
         backoff_factor=CONFIG["REQUEST_BACKOFF"],
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET"],
@@ -78,7 +80,16 @@ def build_session():
     return session
 
 
-http_session = build_session()
+_session_cache = {}
+
+
+def get_session(max_retries):
+    if max_retries not in _session_cache:
+        _session_cache[max_retries] = build_session(max_retries)
+    return _session_cache[max_retries]
+
+
+http_session = get_session(CONFIG["REQUEST_RETRIES"])
 
 # Configure logging
 logging.basicConfig(
@@ -119,6 +130,14 @@ def build_headers():
     }
 
 
+def format_target(target_config):
+    if not target_config:
+        return ""
+    retries = target_config.get("retries")
+    retry_desc = "unlimited" if retries is None else str(retries)
+    return f"{target_config.get('url', '')} (retries={retry_desc})"
+
+
 def verify_proxy_reachability(proxy):
     """Second-chance verification using a free IP lookup API."""
     logging.debug("Verifying reachability for proxy %s", proxy)
@@ -144,6 +163,7 @@ def format_failure_reason(proxy_result):
     reason = proxy_result.get("reason")
     status_code = proxy_result.get("status_code")
     latency = proxy_result.get("latency")
+    target = proxy_result.get("target")
 
     parts = []
     if reason:
@@ -152,73 +172,86 @@ def format_failure_reason(proxy_result):
         parts.append(f"status={status_code}")
     if latency is not None:
         parts.append(f"latency={latency:.2f}s")
+    if target:
+        parts.append(f"target={target}")
 
     return " | ".join(parts) if parts else "unknown failure"
+
+
+def execute_target_request(proxy, target_config):
+    """Run a single request against a configured target using the appropriate session."""
+    session = get_session(target_config.get("retries", CONFIG["REQUEST_RETRIES"]))
+    response = session.get(
+        target_config["url"],
+        proxies={"http": proxy, "https": proxy},
+        timeout=CONFIG["PROXY_TIMEOUT"],
+        verify=CONFIG["VERIFY_SSL"],
+        headers=build_headers(),
+        allow_redirects=False,
+    )
+    return response
 
 
 def test_proxy(proxy):
     """Test proxy connectivity with Google and re-verify with a free API."""
     logging.debug("Testing proxy %s", proxy)
-    start_time = time.time()
+    last_failure = {
+        "proxy": proxy.strip(),
+        "status": "invalid",
+        "reason": "bad status or slow response",
+    }
 
-    try:
-        response = http_session.get(
-            CONFIG["TEST_URL"],
-            proxies={"http": proxy, "https": proxy},
-            timeout=CONFIG["PROXY_TIMEOUT"],
-            verify=CONFIG["VERIFY_SSL"],
-            headers=build_headers(),
-            allow_redirects=False,
-        )
-    except (requests.exceptions.ProxyError, requests.exceptions.ConnectTimeout):
-        # HTTPS tunnels often fail on free proxies; retry with plain HTTP to
-        # confirm whether the proxy works at all.
+    for target_config in CONFIG["FLEXIBLE_TEST_TARGETS"]:
+        start_time = time.time()
         try:
-            response = http_session.get(
-                CONFIG["FALLBACK_TEST_URL"],
-                proxies={"http": proxy, "https": proxy},
-                timeout=CONFIG["PROXY_TIMEOUT"],
-                verify=CONFIG["VERIFY_SSL"],
-                headers=build_headers(),
-                allow_redirects=False,
-            )
-        except Exception as exc:
-            return {
+            response = execute_target_request(proxy, target_config)
+        except (requests.exceptions.ProxyError, requests.exceptions.ConnectTimeout) as exc:
+            last_failure = {
                 "proxy": proxy.strip(),
                 "status": "error",
                 "reason": str(exc),
+                "target": format_target(target_config),
             }
-    except Exception as exc:
-        return {
-            "proxy": proxy.strip(),
-            "status": "error",
-            "reason": str(exc),
-        }
-
-    latency = time.time() - start_time
-
-    if response.status_code in (204, 200) and latency <= CONFIG["LATENCY_THRESHOLD"]:
-        if verify_proxy_reachability(proxy):
-            return {
+            continue
+        except Exception as exc:
+            last_failure = {
                 "proxy": proxy.strip(),
-                "latency": latency,
-                "status": "valid",
+                "status": "error",
+                "reason": str(exc),
+                "target": format_target(target_config),
             }
+            continue
 
-        return {
+        latency = time.time() - start_time
+
+        if response.status_code in (204, 200) and latency <= CONFIG["LATENCY_THRESHOLD"]:
+            if verify_proxy_reachability(proxy):
+                return {
+                    "proxy": proxy.strip(),
+                    "latency": latency,
+                    "status": "valid",
+                    "target": format_target(target_config),
+                }
+
+            last_failure = {
+                "proxy": proxy.strip(),
+                "status": "unreachable",
+                "latency": latency,
+                "reason": "failed reachability check",
+                "target": format_target(target_config),
+            }
+            continue
+
+        last_failure = {
             "proxy": proxy.strip(),
-            "status": "unreachable",
+            "status": "invalid",
+            "status_code": response.status_code,
             "latency": latency,
-            "reason": "failed reachability check",
+            "reason": "bad status or slow response",
+            "target": format_target(target_config),
         }
 
-    return {
-        "proxy": proxy.strip(),
-        "status": "invalid",
-        "status_code": response.status_code,
-        "latency": latency,
-        "reason": "bad status or slow response",
-    }
+    return last_failure
 
 def save_proxies(new_proxies):
     """Save valid proxies to file with deduplication"""
