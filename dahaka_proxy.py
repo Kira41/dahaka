@@ -22,6 +22,9 @@ CONFIG = {
     "API_URL": "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=all",
     # Use Google lightweight endpoint for realistic traffic shape and detection
     "TEST_URL": "https://www.google.com/generate_204",
+    # Some free proxies cannot establish HTTPS tunnels; use a lightweight HTTP
+    # endpoint as a fallback to avoid false negatives.
+    "FALLBACK_TEST_URL": "http://httpbin.org/status/204",
     # Secondary free API to verify that the proxy truly connects to the internet
     "VERIFICATION_URL": "https://ipwho.is/",
     
@@ -167,13 +170,32 @@ def test_proxy(proxy):
             headers=build_headers(),
             allow_redirects=False,
         )
-        latency = time.time() - start_time
+    except (requests.exceptions.ProxyError, requests.exceptions.ConnectTimeout):
+        # HTTPS tunnels often fail on free proxies; retry with plain HTTP to
+        # confirm whether the proxy works at all.
+        try:
+            response = http_session.get(
+                CONFIG["FALLBACK_TEST_URL"],
+                proxies={"http": proxy, "https": proxy},
+                timeout=CONFIG["PROXY_TIMEOUT"],
+                verify=CONFIG["VERIFY_SSL"],
+                headers=build_headers(),
+                allow_redirects=False,
+            )
+        except Exception as exc:
+            return {
+                "proxy": proxy.strip(),
+                "status": "error",
+                "reason": str(exc),
+            }
     except Exception as exc:
         return {
             "proxy": proxy.strip(),
             "status": "error",
             "reason": str(exc),
         }
+
+    latency = time.time() - start_time
 
     if response.status_code in (204, 200) and latency <= CONFIG["LATENCY_THRESHOLD"]:
         if verify_proxy_reachability(proxy):
