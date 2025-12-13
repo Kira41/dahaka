@@ -54,7 +54,7 @@ CONFIG = {
     
     # Logging configuration
     "LOGGING": {
-        "LEVEL": logging.INFO,
+        "LEVEL": logging.DEBUG,
         "FORMAT": f"%(asctime)s - %(levelname)s - {colorama.Style.BRIGHT}%(message)s{colorama.Style.RESET_ALL}",
     }
 }
@@ -88,13 +88,20 @@ logging.getLogger("urllib3").setLevel(logging.ERROR)
 
 def get_proxies_from_api():
     """Fetch proxy list from API"""
+    logging.info("Requesting proxy list from API...")
     try:
         response = http_session.get(
             CONFIG["API_URL"],
             verify=CONFIG["VERIFY_SSL"],
             timeout=CONFIG["PROXY_TIMEOUT"],
         )
-        return response.text.splitlines() if response.status_code == 200 else []
+        if response.status_code == 200:
+            proxies = response.text.splitlines()
+            logging.info("Received %s proxies from API", len(proxies))
+            return proxies
+
+        logging.warning("Proxy API returned status %s", response.status_code)
+        return []
     except Exception as e:
         logging.error(f"Error fetching proxies: {e}")
         return []
@@ -111,6 +118,7 @@ def build_headers():
 
 def verify_proxy_reachability(proxy):
     """Second-chance verification using a free IP lookup API."""
+    logging.debug("Verifying reachability for proxy %s", proxy)
     try:
         response = http_session.get(
             CONFIG["VERIFICATION_URL"],
@@ -127,6 +135,7 @@ def verify_proxy_reachability(proxy):
 
 def test_proxy(proxy):
     """Test proxy connectivity with Google and re-verify with a free API."""
+    logging.debug("Testing proxy %s", proxy)
     try:
         start_time = time.time()
         response = http_session.get(
@@ -142,6 +151,14 @@ def test_proxy(proxy):
         if response.status_code in (204, 200) and latency <= CONFIG["LATENCY_THRESHOLD"]:
             if verify_proxy_reachability(proxy):
                 return (proxy.strip(), latency)
+            logging.debug("Proxy %s failed reachability check", proxy)
+        else:
+            logging.debug(
+                "Proxy %s returned status %s or latency %.2fs exceeded threshold",
+                proxy,
+                response.status_code,
+                latency,
+            )
     except Exception as e:
         logging.debug(f"Proxy {proxy} failed: {str(e)}")
     return None
@@ -203,6 +220,7 @@ def main():
     save_lock = threading.Lock()
 
     while True:
+        logging.info("Starting new proxy validation cycle")
         cycle_start = time.time()
         proxies = get_proxies_from_api()
         total_proxies = len(proxies)
@@ -222,6 +240,10 @@ def main():
                     logging.info(
                         f"Valid proxy found: {proxy} "
                         f"({CONFIG['COLORS']['SUCCESS']}{latency:.2f}s{CONFIG['COLORS']['RESET']})"
+                    )
+                else:
+                    logging.debug(
+                        "Proxy %s is invalid or failed checks", future_to_proxy[future]
                     )
 
         logging.info(
