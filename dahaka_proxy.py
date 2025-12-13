@@ -16,6 +16,7 @@ CONFIG = {
     # Proxy sources
     "API_URL": "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=all",
     "TEST_URL": "https://www.google.com",
+    "SECONDARY_TEST_URL": "https://www.gstatic.com/generate_204",
     
     # Proxy parameters
     "PROXY_TIMEOUT": 10,          # Seconds for proxy to respond
@@ -78,6 +79,21 @@ def test_proxy(proxy):
         logging.debug(f"Proxy {proxy} failed: {str(e)}")
     return None
 
+
+def confirm_proxy(proxy):
+    """Secondary validation to ensure proxy stability before saving"""
+    try:
+        response = requests.get(
+            CONFIG["SECONDARY_TEST_URL"],
+            proxies={"http": proxy, "https": proxy},
+            timeout=CONFIG["PROXY_TIMEOUT"],
+            verify=CONFIG["VERIFY_SSL"]
+        )
+        return response.status_code == 204
+    except Exception as e:
+        logging.debug(f"Secondary check failed for {proxy}: {str(e)}")
+        return False
+
 def save_proxies(new_proxies):
     """Save valid proxies to file with deduplication"""
     try:
@@ -103,24 +119,22 @@ def save_proxies(new_proxies):
 def main():
     while True:
         proxies = get_proxies_from_api()
-        valid_proxies = []
-        
         with ThreadPoolExecutor(max_workers=CONFIG["MAX_WORKERS"]) as executor:
             future_to_proxy = {executor.submit(test_proxy, p): p for p in proxies}
-            
+
             for future in as_completed(future_to_proxy):
                 result = future.result()
                 if result:
                     proxy, latency = result
-                    valid_proxies.append(proxy)
-                    logging.info(
-                        f"Valid proxy found: {proxy} "
-                        f"({CONFIG['COLORS']['SUCCESS']}{latency:.2f}s{CONFIG['COLORS']['RESET']})"
-                    )
+                    if confirm_proxy(proxy):
+                        save_proxies([proxy])
+                        logging.info(
+                            f"Valid proxy confirmed: {proxy} "
+                            f"({CONFIG['COLORS']['SUCCESS']}{latency:.2f}s{CONFIG['COLORS']['RESET']})"
+                        )
+                    else:
+                        logging.debug(f"Proxy failed secondary validation: {proxy}")
 
-        if valid_proxies:
-            save_proxies(valid_proxies)
-        
         logging.info(f"Waiting {CONFIG['RETRY_INTERVAL']} seconds before next check...")
         time.sleep(CONFIG["RETRY_INTERVAL"])
 
